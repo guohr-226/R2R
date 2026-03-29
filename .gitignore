@@ -37,3 +37,4 @@ wandb/*
 runs/*
 evaluate/*
 R2R/eval_output
+model/
