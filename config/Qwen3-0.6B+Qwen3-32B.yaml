@@ -5,30 +5,34 @@
   },
   "quick": {
     "model_name": "Qwen3-0.6B",
-    "model_path": "Qwen/Qwen3-0.6B",
+    "model_path": "/home/guohurui/workspace/model/Qwen3-0.6B",
     "param": "0.6",
+    "tp_size": 1,
+    "base_gpu_id": 1,
     "mem_fraction_static": 0.15
   },
   "reference": {
     "model_name": "Qwen3-32B",
-    "model_path": "Qwen/Qwen3-32B",
+    "model_path": "/home/guohurui/workspace/model/Qwen3-32B-FP8",
     "param": "32",
+    "tp_size": 2,
+    "base_gpu_id": 2,
     "mem_fraction_static": 0.80
   },
   "continuation_main": {
     "model_name": "Qwen3-32B",
-    "model_path": "Qwen/Qwen3-32B",
+    "model_path": "/home/guohurui/workspace/model/Qwen3-32B-FP8",
     "param": "32",
     "tp_size": 2,
-    "base_gpu_id": 2,
+    "base_gpu_id": 3,
     "mem_fraction_static": 0.90
   },
   "continuation_reference": {
     "model_name": "Qwen3-32B",
-    "model_path": "Qwen/Qwen3-32B",
+    "model_path": "/home/guohurui/workspace/model/Qwen3-32B-FP8",
     "param": "32",
     "tp_size": 1,
-    "base_gpu_id": 3,
+    "base_gpu_id": 4,
     "mem_fraction_static": 0.90
   },
   "verify": {
@@ -36,14 +40,14 @@
     "model_path": "Qwen/Qwen2.5-72B-Instruct",
     "mem_fraction_static": 0.90,
     "max_new_tokens": 16,
-    "base_gpu_id": 4,
+    "base_gpu_id": 5,
     "tp_size": 4
   },
   "router": {
     "router_name": "Qwen3-0.6B+Qwen3-32B",
-    "router_path": "nics-efc/R2R_router_collections/Qwen3-0.6B+Qwen3-32B/default_router.pt",
+    "router_path": "/home/guohurui/workspace/R2R_router_collections/Qwen3-0.6B+Qwen3-32B/default_router.pt",
     "override_init_args":{
-      "pretrained_model_name": "Qwen/Qwen3-0.6B"
+      "pretrained_model_name": "/home/guohurui/workspace/model/Qwen3-0.6B"
     }
   }
 }
