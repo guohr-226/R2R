@@ -52,10 +52,19 @@ def get_mem_fraction_statics(
     quick_sglang_kwargs: Dict = {},
     reference_sglang_kwargs: Dict = {},
     quick_num_gpus: int = 1,
-    reference_num_gpus: int = 1
+    reference_num_gpus: int = 1,
+    quick_base_gpu_id: int = 0,
+    reference_base_gpu_id: int = 0,
 ) -> Tuple[float, float]:
     if not overlap_tp_schedule:
-        return 0.9, 0.9
+        quick_mem_fraction = float(model_config.get("quick", {}).get("mem_fraction_static", 0.9))
+        reference_mem_fraction = float(model_config.get("reference", {}).get("mem_fraction_static", 0.9))
+        print(
+            "[SLDisaggregationSystem] overlap_tp_schedule=False, "
+            f"use config mem_fraction_static: quick={quick_mem_fraction}, "
+            f"reference={reference_mem_fraction}"
+        )
+        return quick_mem_fraction, reference_mem_fraction
 
     small_server_args = ServerArgs(
         model_path=model_config["quick"]["model_path"],
@@ -99,7 +108,10 @@ def get_mem_fraction_statics(
     small_model_mem = small_bytes * float(model_config["quick"]["param"]) # in GB
     large_bytes = torch.tensor([], dtype=large_model_config.dtype).element_size()
     large_model_mem = large_bytes * float(model_config["reference"]["param"]) # in GB
-    total_gpu_memory = min(torch.cuda.get_device_properties(i).total_memory for i in range(max(quick_num_gpus,reference_num_gpus))) / (1 << 30) # in GB
+    quick_gpu_ids = [quick_base_gpu_id + i for i in range(quick_num_gpus)]
+    reference_gpu_ids = [reference_base_gpu_id + i for i in range(reference_num_gpus)]
+    involved_gpu_ids = sorted(set(quick_gpu_ids + reference_gpu_ids))
+    total_gpu_memory = min(torch.cuda.get_device_properties(i).total_memory for i in involved_gpu_ids) / (1 << 30) # in GB
     available_gpu_memory = (total_gpu_memory * 0.85 - (small_model_mem / quick_num_gpus + large_model_mem / reference_num_gpus))
 
     assert available_gpu_memory >= 0, f"Not enough GPU memory for both models: total {total_gpu_memory} GB, used {small_model_mem / quick_num_gpus + large_model_mem / reference_num_gpus} GB"
@@ -172,6 +184,14 @@ class SLDisaggregationSystem:
         # GPU info
         self.quick_num_gpus = quick_sglang_kwargs.get("tp_size", torch.cuda.device_count())
         self.reference_num_gpus = reference_sglang_kwargs.get("tp_size", torch.cuda.device_count())
+        self.quick_base_gpu_id = int(self.model_config["quick"].get("base_gpu_id", 0))
+        self.reference_base_gpu_id = int(self.model_config["reference"].get("base_gpu_id", 0))
+        self.quick_gpu_ids = [
+            self.quick_base_gpu_id + rank for rank in range(self.quick_num_gpus)
+        ]
+        self.reference_gpu_ids = [
+            self.reference_base_gpu_id + rank for rank in range(self.reference_num_gpus)
+        ]
         #self.world_size = self.num_gpus
 
         # Create dictionary to store recorders
@@ -184,6 +204,10 @@ class SLDisaggregationSystem:
         reference_sglang_kwargs["tp_size"] = self.reference_num_gpus
         assert self.reference_num_gpus >= 1, f"Using {self.reference_num_gpus} GPUs for SGLang, expected larger than 1."
         print(f"Using {self.reference_num_gpus+self.quick_num_gpus if overlap_tp_schedule is False else max(self.reference_num_gpus, self.quick_num_gpus)} GPUs for SGLang, with {self.quick_num_gpus} for quick.")
+        print(
+            f"Quick model GPU(s): {self.quick_gpu_ids}; "
+            f"reference model GPU(s): {self.reference_gpu_ids}"
+        )
 
         # ZMQ PUB socket (broadcast producer) so all TP ranks receive the same message
         self.zmq_ctx = zmq.Context.instance()
@@ -203,6 +227,8 @@ class SLDisaggregationSystem:
             reference_sglang_kwargs=reference_sglang_kwargs,
             quick_num_gpus=self.quick_num_gpus,
             reference_num_gpus=self.reference_num_gpus,
+            quick_base_gpu_id=self.quick_base_gpu_id,
+            reference_base_gpu_id=self.reference_base_gpu_id,
         )
 
         """
@@ -223,6 +249,7 @@ class SLDisaggregationSystem:
             model_config=self.model_config,
             quick_sglang_kwargs=quick_sglang_kwargs,
             quick_num_gpus=self.quick_num_gpus,
+            quick_base_gpu_id=self.quick_base_gpu_id,
             req_port=self.req_port,
             ready_queue=self._quick_ready_queue,
             switching_strategy=self.switching_strategy,
@@ -254,6 +281,7 @@ class SLDisaggregationSystem:
             model_config=self.model_config,
             reference_sglang_kwargs=reference_sglang_kwargs,
             quick_num_gpus=self.quick_num_gpus,
+            reference_base_gpu_id=self.reference_base_gpu_id,
             reference_num_gpus=self.reference_num_gpus,
             reference_master_port=find_free_port(),
             ready_queue=self._llm_ready_queue,

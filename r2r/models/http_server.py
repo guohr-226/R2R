@@ -86,15 +86,43 @@ async def lifespan(app: FastAPI):
         router_config = model_config.get("router", {})
         router_path = router_config.get("router_path")
 
+        quick_tp_size_cfg = int(model_config.get("quick", {}).get("tp_size", 1))
+        reference_tp_size_cfg = int(model_config.get("reference", {}).get("tp_size", 1))
+        quick_cfg = model_config.get("quick", {})
+        reference_cfg = model_config.get("reference", {})
+
+        quick_tp_size_cli = getattr(server_args, "tp_size_quick", None)
+        reference_tp_size_cli = getattr(server_args, "tp_size_ref", None)
+
+        quick_tp_size = quick_tp_size_cfg if quick_tp_size_cli is None else int(quick_tp_size_cli)
+        reference_tp_size = (
+            reference_tp_size_cfg if reference_tp_size_cli is None else int(reference_tp_size_cli)
+        )
+        if quick_tp_size < 1 or reference_tp_size < 1:
+            raise ValueError(
+                f"tp_size must be >= 1, got quick={quick_tp_size}, reference={reference_tp_size}"
+            )
+        print(
+            f"Using TP sizes: quick={quick_tp_size} "
+            f"({'config' if quick_tp_size_cli is None else 'cli'}), "
+            f"reference={reference_tp_size} "
+            f"({'config' if reference_tp_size_cli is None else 'cli'})"
+        )
+
         quick_sglang_kwargs = {
             "dtype": "bfloat16",
-            "tp_size": server_args.tp_size_quick,
+            "tp_size": quick_tp_size,
             "enable_return_hidden_states": True
         }
         reference_sglang_kwargs = {
             "dtype": "bfloat16",
-            "tp_size": server_args.tp_size_ref
+            "tp_size": reference_tp_size
         }
+        for key in ("disable_cuda_graph", "cuda_graph_max_bs", "cuda_graph_bs"):
+            if key in quick_cfg:
+                quick_sglang_kwargs[key] = quick_cfg[key]
+            if key in reference_cfg:
+                reference_sglang_kwargs[key] = reference_cfg[key]
 
         # Determine switching strategy first
         switching_strategy = router_config.get("switching_strategy")

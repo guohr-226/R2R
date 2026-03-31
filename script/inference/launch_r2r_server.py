@@ -36,8 +36,18 @@ if __name__ == "__main__":
         default=30000,
         help="Port to bind the server to"
     )
-    parser.add_argument("--tp-size-quick", type=int, default=1)
-    parser.add_argument("--tp-size-ref", type=int, default=1)
+    parser.add_argument(
+        "--tp-size-quick",
+        type=int,
+        default=None,
+        help="Tensor parallel size for quick model. If omitted, use quick.tp_size from config.",
+    )
+    parser.add_argument(
+        "--tp-size-ref",
+        type=int,
+        default=None,
+        help="Tensor parallel size for reference model. If omitted, use reference.tp_size from config.",
+    )
     parser.add_argument("--overlap-tp-schedule", action="store_true", default=False)
     parser.add_argument('--threshold', type=float, default=0.5,
                         help='Threshold for the neural switching strategy (default: 0.5).')

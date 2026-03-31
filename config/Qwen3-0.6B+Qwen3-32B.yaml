@@ -17,14 +17,15 @@
     "param": "32",
     "tp_size": 2,
     "base_gpu_id": 2,
-    "mem_fraction_static": 0.80
+    "mem_fraction_static": 0.80,
+    "disable_cuda_graph": true
   },
   "continuation_main": {
     "model_name": "Qwen3-32B",
     "model_path": "/home/guohurui/workspace/model/Qwen3-32B-FP8",
     "param": "32",
     "tp_size": 2,
-    "base_gpu_id": 3,
+    "base_gpu_id": 2,
     "mem_fraction_static": 0.90
   },
   "continuation_reference": {
@@ -40,8 +41,8 @@
     "model_path": "Qwen/Qwen2.5-72B-Instruct",
     "mem_fraction_static": 0.90,
     "max_new_tokens": 16,
-    "base_gpu_id": 5,
-    "tp_size": 4
+    "tp_size": 4,
+    "base_gpu_id": 4
   },
   "router": {
     "router_name": "Qwen3-0.6B+Qwen3-32B",

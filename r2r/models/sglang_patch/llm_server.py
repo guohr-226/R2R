@@ -46,6 +46,7 @@ class LLMServer:
         model_config: dict,
         reference_sglang_kwargs: dict,
         quick_num_gpus: int,
+        reference_base_gpu_id: int,
         reference_num_gpus: int,
         reference_master_port: int | None = None,
         ready_queue: Optional[mp.Queue] = None,
@@ -61,6 +62,7 @@ class LLMServer:
         self.model_config = model_config
         self.reference_sglang_kwargs = reference_sglang_kwargs
         self.quick_num_gpus = quick_num_gpus if overlap_tp_schedule is False else 0
+        self.reference_base_gpu_id = reference_base_gpu_id
         self.reference_num_gpus = reference_num_gpus
         # Queue for signaling worker readiness to outside controller (e.g., SLDisaggregationSystem)
         self.ready_queue = ready_queue
@@ -129,17 +131,32 @@ class LLMServer:
             pass
 
         print(f"Loading reference model {self.model_config['reference']['model_name']}...")
+        print(
+            f"Reference model GPUs: "
+            f"{[self.reference_base_gpu_id + rank for rank in range(self.reference_num_gpus)]}"
+        )
 
         if reference_sglang_kwargs.get("attention_backend", None) != "flashinfer":
             print(f"Only support flashinfer attention backend for reference model.")
             reference_sglang_kwargs["attention_backend"] = "flashinfer"
+
+        reference_disable_cuda_graph = bool(
+            reference_sglang_kwargs.pop(
+                "disable_cuda_graph",
+                self.model_config.get("reference", {}).get("disable_cuda_graph", False),
+            )
+        )
+        reference_mem_fraction_static = reference_sglang_kwargs.pop(
+            "mem_fraction_static",
+            mem_fraction_static,
+        )
         
         reference_server_args = ServerArgs(
             model_path=self.model_config["reference"]["model_path"],
-            disable_cuda_graph=False,
+            disable_cuda_graph=reference_disable_cuda_graph,
             disable_overlap_schedule=True,
             disable_radix_cache=True,
-            mem_fraction_static=mem_fraction_static,
+            mem_fraction_static=reference_mem_fraction_static,
             **reference_sglang_kwargs,
         )
         reference_server_args.tp_size = reference_num_gpus
@@ -153,7 +170,7 @@ class LLMServer:
                 target=self.reference_model_worker,
                 args=(
                     rank, 
-                    self.quick_num_gpus, 
+                    self.reference_base_gpu_id,
                     self.reference_num_gpus, 
                     reference_server_args, 
                     self.reference_master_port, 
@@ -170,7 +187,7 @@ class LLMServer:
             self.reference_model_procs.append(proc)
 
     @staticmethod
-    def reference_model_worker(rank, quick_num_gpus: int, world_size: int, server_args: ServerArgs, master_port: int = 29500, ready_queue: Optional[mp.Queue] = None, inbound_queue: Optional[mp.Queue] = None, outbound_queue: Optional[mp.Queue] = None, llm_kvcache_size: Optional[Value] = None, min_batch_size: Union[int, list[int]] = 1):
+    def reference_model_worker(rank, base_gpu_id: int, world_size: int, server_args: ServerArgs, master_port: int = 29500, ready_queue: Optional[mp.Queue] = None, inbound_queue: Optional[mp.Queue] = None, outbound_queue: Optional[mp.Queue] = None, llm_kvcache_size: Optional[Value] = None, min_batch_size: Union[int, list[int]] = 1):
         # Register signal handler to ensure finally block execution on terminate
         def _worker_sig_handler(signum, frame):
             sys.exit(0)
@@ -178,13 +195,14 @@ class LLMServer:
         # Use a dedicated tcp init_method to avoid port collision with quick model's default 29500 store
         init_method = f"tcp://127.0.0.1:{master_port}"
         dist.init_process_group(backend='nccl', init_method=init_method, rank=rank, world_size=world_size)
-        torch.cuda.set_device(rank + quick_num_gpus)
+        gpu_id = base_gpu_id + rank
+        torch.cuda.set_device(gpu_id)
 
         port_args = PortArgs.init_new(server_args)
         scheduler = LLMScheduler(
             server_args=server_args,
             port_args=port_args,
-            gpu_id=rank+quick_num_gpus,
+            gpu_id=gpu_id,
             tp_rank=rank,
             dp_rank=0,
             moe_ep_rank=0,

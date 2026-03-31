@@ -50,6 +50,11 @@ class DynamicSimpleSGLangSelector:
         
         self.num_gpus = reference_sglang_kwargs.get("tp_size", torch.cuda.device_count())
         self.world_size = self.num_gpus
+        self.quick_gpu_id = int(MODEL_DICT["quick"].get("base_gpu_id", 1))
+        self.reference_base_gpu_id = int(MODEL_DICT["reference"].get("base_gpu_id", 0))
+        self.reference_gpu_ids = [
+            self.reference_base_gpu_id + rank for rank in range(self.world_size)
+        ]
 
         # Create dictionary to store recorders
         self.generation_records = {}
@@ -59,6 +64,10 @@ class DynamicSimpleSGLangSelector:
         reference_sglang_kwargs["tp_size"] = self.world_size
         assert self.num_gpus >= 2, f"Using {self.num_gpus} GPUs for SGLang, expected larger than 2."
         print(f"Using {self.num_gpus} GPUs for SGLang, with {self.world_size} for reference and 1 for quick.")
+        print(
+            f"Quick model GPU: {self.quick_gpu_id}; "
+            f"reference model GPUs: {self.reference_gpu_ids}"
+        )
 
         # Initialize SGLang models
         print(f"Loading quick model {MODEL_DICT['quick']['model_name']}...")
@@ -75,7 +84,7 @@ class DynamicSimpleSGLangSelector:
         self.quick_scheduler = Scheduler(
             server_args=self.quick_server_args,
             port_args=quick_port_args,
-            gpu_id=1,
+            gpu_id=self.quick_gpu_id,
             tp_rank=0,
             dp_rank=0,
         )
@@ -102,7 +111,15 @@ class DynamicSimpleSGLangSelector:
         for rank in range(self.world_size):
             proc = mp.Process(
                 target=self.reference_model_worker,
-                args=(rank, self.world_size, self.reference_server_args, self.reference_model_input_queues, self.reference_model_output_queue, self.reference_model_ack_queues[rank]),
+                args=(
+                    rank,
+                    self.world_size,
+                    self.reference_base_gpu_id,
+                    self.reference_server_args,
+                    self.reference_model_input_queues,
+                    self.reference_model_output_queue,
+                    self.reference_model_ack_queues[rank],
+                ),
             )
             proc.start()
             self.reference_model_procs.append(proc)
@@ -166,11 +183,12 @@ class DynamicSimpleSGLangSelector:
         self.quick_scheduler.last_batch = batch
 
     @staticmethod
-    def reference_model_worker(rank, world_size: int, server_args: ServerArgs, input_queues: List[mp.Queue], output_queue: mp.Queue, ack_queue: mp.Queue):
+    def reference_model_worker(rank, world_size: int, base_gpu_id: int, server_args: ServerArgs, input_queues: List[mp.Queue], output_queue: mp.Queue, ack_queue: mp.Queue):
 
         # initialize the process group
         dist.init_process_group(backend='nccl', rank=rank, world_size=world_size)
-        torch.cuda.set_device(rank)
+        gpu_id = base_gpu_id + rank
+        torch.cuda.set_device(gpu_id)
 
         global end_of_cache_loc
         end_of_cache_loc = 0
@@ -180,7 +198,7 @@ class DynamicSimpleSGLangSelector:
         scheduler = Scheduler(
             server_args=server_args,
             port_args=port_args,
-            gpu_id=rank,
+            gpu_id=gpu_id,
             tp_rank=rank,
             dp_rank=0,
         )

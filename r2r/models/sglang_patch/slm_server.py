@@ -43,6 +43,7 @@ class SLMServer:
         model_config: Dict,
         quick_sglang_kwargs: Dict,
         quick_num_gpus: int,
+        quick_base_gpu_id: int,
         req_port: int,
         ready_queue: Optional[mp.Queue] = None,
         switching_strategy: str = "neural",
@@ -59,6 +60,7 @@ class SLMServer:
         self.model_config = model_config
         self.quick_sglang_kwargs = quick_sglang_kwargs
         self.quick_num_gpus = quick_num_gpus
+        self.quick_base_gpu_id = quick_base_gpu_id
         self.req_port = req_port
         self.ready_queue = ready_queue
         self.switching_strategy = switching_strategy
@@ -145,6 +147,10 @@ class SLMServer:
         self._recv_from_llm_stop = threading.Event()
 
         print(f"Loading quick model {self.model_config['quick']['model_name']}...")
+        print(
+            f"Quick model GPUs: "
+            f"{[self.quick_base_gpu_id + rank for rank in range(self.quick_num_gpus)]}"
+        )
         # readiness queue
         self.ready_queue = ready_queue
 
@@ -161,12 +167,23 @@ class SLMServer:
         except Exception:
             pass
 
+        quick_disable_cuda_graph = bool(
+            quick_sglang_kwargs.pop(
+                "disable_cuda_graph",
+                self.model_config.get("quick", {}).get("disable_cuda_graph", False),
+            )
+        )
+        quick_mem_fraction_static = quick_sglang_kwargs.pop(
+            "mem_fraction_static",
+            mem_fraction_static,
+        )
+
         quick_server_args = ServerArgs(
             model_path=self.model_config["quick"]["model_path"],
-            disable_cuda_graph=False,
+            disable_cuda_graph=quick_disable_cuda_graph,
             disable_overlap_schedule=True,
             disable_radix_cache=False,
-            mem_fraction_static=mem_fraction_static,
+            mem_fraction_static=quick_mem_fraction_static,
             **quick_sglang_kwargs,
         )
         quick_server_args.tp_size = quick_num_gpus
@@ -182,6 +199,7 @@ class SLMServer:
                 args=(
                     rank, 
                     quick_num_gpus,
+                    self.quick_base_gpu_id,
                     quick_server_args,
                     self.ready_queue,
                     self.switching_strategy,
@@ -224,6 +242,7 @@ class SLMServer:
     def quick_model_worker(
         rank,
         world_size: int,
+        base_gpu_id: int,
         server_args: ServerArgs,
         ready_queue: Optional[mp.Queue] = None,
         switching_strategy: str = "neural",
@@ -248,13 +267,14 @@ class SLMServer:
             raise RuntimeError("MASTER_PORT must be provided or set in environment")
         
         dist.init_process_group(backend='nccl', rank=rank, world_size=world_size)
-        torch.cuda.set_device(rank)
+        gpu_id = base_gpu_id + rank
+        torch.cuda.set_device(gpu_id)
 
         port_args = PortArgs.init_new(server_args)
         scheduler = Scheduler(
             server_args=server_args,
             port_args=port_args,
-            gpu_id=rank,
+            gpu_id=gpu_id,
             tp_rank=rank,
             dp_rank=0,
             moe_ep_rank=0,
