@@ -76,7 +76,7 @@ class ChatCompletionResponse(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global system
-    print("Initializing SLDisaggregationSystem inside lifespan...")
+    print("Initializing R2R system inside lifespan...")
 
     if server_args:
         # Load config from path (file or folder)
@@ -110,15 +110,28 @@ async def lifespan(app: FastAPI):
         )
 
         quick_sglang_kwargs = {
-            "dtype": "bfloat16",
+            "dtype": quick_cfg.get("dtype", "bfloat16"),
             "tp_size": quick_tp_size,
-            "enable_return_hidden_states": True
+            "enable_return_hidden_states": True,
         }
         reference_sglang_kwargs = {
-            "dtype": "bfloat16",
-            "tp_size": reference_tp_size
+            "dtype": reference_cfg.get("dtype", "bfloat16"),
+            "tp_size": reference_tp_size,
         }
-        for key in ("disable_cuda_graph", "cuda_graph_max_bs", "cuda_graph_bs"):
+        passthrough_keys = (
+            "disable_cuda_graph",
+            "cuda_graph_max_bs",
+            "cuda_graph_bs",
+            "disable_custom_all_reduce",
+            "trust_remote_code",
+            "max_prefill_tokens",
+            "max_total_tokens",
+            "kv_cache_dtype",
+            "skip_server_warmup",
+            "schedule_conservativeness",
+            "mem_fraction_static",
+        )
+        for key in passthrough_keys:
             if key in quick_cfg:
                 quick_sglang_kwargs[key] = quick_cfg[key]
             if key in reference_cfg:
@@ -152,18 +165,29 @@ async def lifespan(app: FastAPI):
                 strategy_kwargs["entropy_threshold"] = router_config["entropy_threshold"]
                 print(f"Using entropy threshold from config: {router_config['entropy_threshold']}")
 
+        reference_backend = reference_cfg.get("backend", "sglang")
+
         try:
-            system = SLDisaggregationSystem(
-                model_config=model_config,
-                device="cuda",
-                dtype="bfloat16",
-                switching_strategy=switching_strategy,
-                strategy_kwargs=strategy_kwargs,
-                quick_sglang_kwargs=quick_sglang_kwargs,
-                reference_sglang_kwargs=reference_sglang_kwargs,
-                overlap_tp_schedule=server_args.overlap_tp_schedule,
-                llm_min_batch_size=server_args.llm_min_batch_size,
-            )
+            if reference_backend == "dashscope_openai":
+                from r2r.models.dashscope_hybrid_system import DashScopeHybridSystem
+
+                system = DashScopeHybridSystem(
+                    model_config=model_config,
+                    switching_strategy=switching_strategy,
+                    strategy_kwargs=strategy_kwargs,
+                )
+            else:
+                system = SLDisaggregationSystem(
+                    model_config=model_config,
+                    device="cuda",
+                    dtype="bfloat16",
+                    switching_strategy=switching_strategy,
+                    strategy_kwargs=strategy_kwargs,
+                    quick_sglang_kwargs=quick_sglang_kwargs,
+                    reference_sglang_kwargs=reference_sglang_kwargs,
+                    overlap_tp_schedule=server_args.overlap_tp_schedule,
+                    llm_min_batch_size=server_args.llm_min_batch_size,
+                )
             print("System initialized successfully.")
         except Exception as e:
             print(f"Failed to initialize system: {e}")
@@ -242,49 +266,66 @@ async def chat_completions(request: ChatCompletionRequest):
         # Convert messages to text using chat template
         messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
         
-        # Apply chat template if available
-        if hasattr(system.tokenizer, 'apply_chat_template'):
-            input_ids = system.tokenizer.apply_chat_template(
-                messages, 
-                add_generation_prompt=True,
-                tokenize=True
+        if hasattr(system, "generate_chat_completion"):
+            result = await system.generate_chat_completion(
+                messages=messages,
+                max_new_tokens=request.max_tokens or 2048,
+                temperature=request.temperature if request.temperature is not None else 1.0,
+                top_p=request.top_p if request.top_p is not None else 1.0,
+                top_k=-1,
             )
+            input_ids = system.encode_messages(messages)
+            output_ids = result.get("output_ids", [])
+            output_text = result.get("output_text")
+            if output_text is None:
+                output_text = system.tokenizer.decode(output_ids, skip_special_tokens=True)
+            prompt_tokens = len(input_ids)
+            completion_tokens = len(output_ids)
+            llm_ratio = result.get("llm_ratio", None)
         else:
-            # Fallback: concatenate messages
-            text = "\n".join([f"{msg['role']}: {msg['content']}" for msg in messages])
-            input_ids = system.tokenizer.encode(text)
+            # Apply chat template if available
+            if hasattr(system.tokenizer, 'apply_chat_template'):
+                input_ids = system.tokenizer.apply_chat_template(
+                    messages, 
+                    add_generation_prompt=True,
+                    tokenize=True
+                )
+            else:
+                # Fallback: concatenate messages
+                text = "\n".join([f"{msg['role']}: {msg['content']}" for msg in messages])
+                input_ids = system.tokenizer.encode(text)
         
-        prompt_tokens = len(input_ids)
-        
-        sampling_params = {
-            "temperature": 1.0,
-            "top_p":  1.0,
-            "top_k": -1,
-            "max_new_tokens": 2048,
-        }
+            prompt_tokens = len(input_ids)
+            
+            sampling_params = {
+                "temperature": 1.0,
+                "top_p":  1.0,
+                "top_k": -1,
+                "max_new_tokens": 2048,
+            }
 
-        if request.temperature is not None:
-            sampling_params["temperature"] = request.temperature
-        if request.top_p is not None:
-            sampling_params["top_p"] = request.top_p
-        if request.max_tokens is not None:
-            sampling_params["max_new_tokens"] = request.max_tokens
+            if request.temperature is not None:
+                sampling_params["temperature"] = request.temperature
+            if request.top_p is not None:
+                sampling_params["top_p"] = request.top_p
+            if request.max_tokens is not None:
+                sampling_params["max_new_tokens"] = request.max_tokens
 
-        # Generate response
-        result = await system.generate_one_request(
-            input_id=input_ids,
-            max_new_tokens=sampling_params["max_new_tokens"],
-            temperature=sampling_params["temperature"],
-            top_p=sampling_params["top_p"],
-            top_k=sampling_params["top_k"],
-            display_progress=False
-        )
-        
-        # Extract output
-        output_ids = result.output_ids if hasattr(result, 'output_ids') else result.get('output_ids', [])
-        output_text = system.tokenizer.decode(output_ids, skip_special_tokens=True)
-        completion_tokens = len(output_ids)
-        llm_ratio = result.get('llm_ratio', None) if isinstance(result, dict) else getattr(result, 'llm_ratio', None)
+            # Generate response
+            result = await system.generate_one_request(
+                input_id=input_ids,
+                max_new_tokens=sampling_params["max_new_tokens"],
+                temperature=sampling_params["temperature"],
+                top_p=sampling_params["top_p"],
+                top_k=sampling_params["top_k"],
+                display_progress=False
+            )
+            
+            # Extract output
+            output_ids = result.output_ids if hasattr(result, 'output_ids') else result.get('output_ids', [])
+            output_text = system.tokenizer.decode(output_ids, skip_special_tokens=True)
+            completion_tokens = len(output_ids)
+            llm_ratio = result.get('llm_ratio', None) if isinstance(result, dict) else getattr(result, 'llm_ratio', None)
         
         # Build OpenAI-compatible response
         response = ChatCompletionResponse(

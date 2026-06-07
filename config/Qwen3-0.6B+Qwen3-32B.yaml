@@ -8,7 +8,7 @@
     "model_path": "/home/guohurui/workspace/model/Qwen3-0.6B",
     "param": "0.6",
     "tp_size": 1,
-    "base_gpu_id": 1,
+    "base_gpu_id": 0,
     "mem_fraction_static": 0.15
   },
   "reference": {
@@ -16,16 +16,24 @@
     "model_path": "/home/guohurui/workspace/model/Qwen3-32B-FP8",
     "param": "32",
     "tp_size": 2,
-    "base_gpu_id": 2,
-    "mem_fraction_static": 0.80,
-    "disable_cuda_graph": true
+    "base_gpu_id": 1,
+    "dtype": "bfloat16",
+    "trust_remote_code": true,
+    "mem_fraction_static": 0.8,
+    "max_prefill_tokens": 4096,
+    "max_total_tokens": 8192,
+    "kv_cache_dtype": "auto",
+    "disable_cuda_graph": true,
+    "disable_custom_all_reduce": true,
+    "skip_server_warmup": true,
+    "schedule_conservativeness": 1.5
   },
   "continuation_main": {
     "model_name": "Qwen3-32B",
     "model_path": "/home/guohurui/workspace/model/Qwen3-32B-FP8",
     "param": "32",
     "tp_size": 2,
-    "base_gpu_id": 2,
+    "base_gpu_id": 1,
     "mem_fraction_static": 0.90
   },
   "continuation_reference": {
@@ -33,7 +41,7 @@
     "model_path": "/home/guohurui/workspace/model/Qwen3-32B-FP8",
     "param": "32",
     "tp_size": 1,
-    "base_gpu_id": 4,
+    "base_gpu_id": 3,
     "mem_fraction_static": 0.90
   },
   "verify": {

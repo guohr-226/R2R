@@ -441,6 +441,37 @@ class SLMServer:
         return recv_reqs
 
     @staticmethod
+    def _safe_remove_issued_req(scheduler: Scheduler, req: Req):
+        """Remove req from scheduler.issued_reqs without raising on duplicate completion paths."""
+        issued_reqs = getattr(scheduler, "issued_reqs", None)
+        if issued_reqs is None:
+            return
+
+        # Fast path: exact object match.
+        try:
+            issued_reqs.remove(req)
+            return
+        except (KeyError, ValueError):
+            pass
+        except Exception:
+            pass
+
+        # Fallback: object identity may differ after batch merge/filter, remove by rid.
+        rid = getattr(req, "rid", None)
+        if rid is None:
+            return
+        try:
+            for existing_req in list(issued_reqs):
+                if getattr(existing_req, "rid", None) == rid:
+                    try:
+                        issued_reqs.remove(existing_req)
+                    except Exception:
+                        pass
+                    break
+        except Exception:
+            pass
+
+    @staticmethod
     def process_result_from_llm(rank: int, scheduler: Scheduler, commit_msgs, finished_queue: Optional[mp.Queue] = None, outbound_queue: Optional[mp.Queue] = None):
         if rank == 0 and hasattr(scheduler, "n_generated_tokens"):
             scheduler.n_generated_tokens += len(commit_msgs)
@@ -489,7 +520,7 @@ class SLMServer:
                 SLMServer.process_finished_requests(finished_reqs, scheduler.tokenizer, finished_queue, outbound_queue)
             if finished_reqs:
                 for req in finished_reqs:
-                    scheduler.issued_reqs.remove(req)
+                    SLMServer._safe_remove_issued_req(scheduler, req)
     
     @staticmethod
     def simple_prepare_for_extend(batch: ScheduleBatch):
@@ -730,7 +761,7 @@ class SLMServer:
             SLMServer.process_finished_requests(finished_reqs, scheduler.tokenizer, finished_queue, outbound_queue)
         if len(finished_reqs) > 0:
             for req in finished_reqs:
-                scheduler.issued_reqs.remove(req)
+                SLMServer._safe_remove_issued_req(scheduler, req)
         if len(req_to_send) > 0:
             scheduler.check_batch_status(batch)
             if rank == 0:

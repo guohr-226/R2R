@@ -1,0 +1,27 @@
+{
+  "special_tokens": {
+    "think_start": 151667,
+    "think_end": 151668
+  },
+  "quick": {
+    "model_name": "Qwen3-1.7B",
+    "model_path": "../model/Qwen3-1.7B-Base",
+    "param": "1.7",
+    "dtype": "bfloat16",
+    "trust_remote_code": true,
+    "mem_fraction_static": 0.15
+  },
+  "reference": {
+    "model_name": "qwen3.5-35b-a3b",
+    "backend": "dashscope_openai",
+    "base_url_env": "DASHSCOPE_BASE_URL",
+    "api_key_env": "DASHSCOPE_API_KEY"
+  },
+  "router": {
+    "router_name": "Qwen3-1.7B+Qwen3-8B",
+    "router_path": "../R2R_router_collections/Qwen3-1.7B+Qwen3-8B/default_router.pt",
+    "override_init_args": {
+      "pretrained_model_name": "../model/Qwen3-1.7B-Base"
+    }
+  }
+}
