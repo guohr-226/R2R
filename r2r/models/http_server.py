@@ -33,6 +33,7 @@ class GenerateReqInput(SGLangGenerateReqInput):
     # top_p: float = 1.0
     # top_k: int = 100
     display_progress: bool = False
+    return_trace: Optional[bool] = False
 
 
 # OpenAI Chat Completion API Models
@@ -50,6 +51,8 @@ class ChatCompletionRequest(BaseModel):
     stream: Optional[bool] = False
     stop: Optional[Union[str, List[str]]] = None
     n: Optional[int] = 1
+    return_trace: Optional[bool] = False
+    trace_in_content: Optional[bool] = False
 
 
 class ChatCompletionChoice(BaseModel):
@@ -72,6 +75,17 @@ class ChatCompletionResponse(BaseModel):
     choices: List[ChatCompletionChoice]
     usage: UsageInfo
     llm_ratio: float
+    slm_token_count: Optional[int] = None
+    llm_token_count: Optional[int] = None
+    router_trigger_count: Optional[int] = None
+    routed_token_count: Optional[int] = None
+    token_trace: Optional[List[Dict[str, Any]]] = None
+
+
+def _result_value(result, key: str, default=None):
+    if isinstance(result, dict):
+        return result.get(key, default)
+    return getattr(result, key, default)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -236,15 +250,29 @@ async def generate_request(obj: GenerateReqInput):
         )
         
         
-        output_ids = result.output_ids if hasattr(result, 'output_ids') else result.get('output_ids', [])
-        output_text = system.tokenizer.decode(output_ids, skip_special_tokens=True)
+        output_ids = _result_value(result, 'output_ids', [])
+        output_text = _result_value(result, 'output_text')
+        if output_text is None:
+            output_text = system.tokenizer.decode(output_ids, skip_special_tokens=True)
+        slm_token_count = _result_value(result, 'slm_token_count', 0)
+        llm_token_count = _result_value(result, 'llm_token_count', 0)
+        router_trigger_count = _result_value(result, 'router_trigger_count', llm_token_count)
+        routed_token_count = _result_value(result, 'routed_token_count', llm_token_count)
+        token_trace = _result_value(result, 'token_trace', [])
         
-        return {
+        response = {
             "text": output_text,
             "input_ids": input_ids,
             "output_ids": output_ids,
-            "llm_ratio": result.get('llm_ratio', None) if isinstance(result, dict) else None
+            "llm_ratio": _result_value(result, 'llm_ratio', None),
+            "slm_token_count": slm_token_count,
+            "llm_token_count": llm_token_count,
+            "router_trigger_count": router_trigger_count,
+            "routed_token_count": routed_token_count,
         }
+        if obj.display_progress or obj.return_trace:
+            response["token_trace"] = token_trace
+        return response
 
     except Exception as e:
         logger.error(f"Generation failed: {e}")
@@ -275,13 +303,13 @@ async def chat_completions(request: ChatCompletionRequest):
                 top_k=-1,
             )
             input_ids = system.encode_messages(messages)
-            output_ids = result.get("output_ids", [])
-            output_text = result.get("output_text")
+            output_ids = _result_value(result, "output_ids", [])
+            output_text = _result_value(result, "output_text")
             if output_text is None:
                 output_text = system.tokenizer.decode(output_ids, skip_special_tokens=True)
             prompt_tokens = len(input_ids)
             completion_tokens = len(output_ids)
-            llm_ratio = result.get("llm_ratio", None)
+            llm_ratio = _result_value(result, "llm_ratio", None)
         else:
             # Apply chat template if available
             if hasattr(system.tokenizer, 'apply_chat_template'):
@@ -322,10 +350,30 @@ async def chat_completions(request: ChatCompletionRequest):
             )
             
             # Extract output
-            output_ids = result.output_ids if hasattr(result, 'output_ids') else result.get('output_ids', [])
-            output_text = system.tokenizer.decode(output_ids, skip_special_tokens=True)
+            output_ids = _result_value(result, 'output_ids', [])
+            output_text = _result_value(result, 'output_text')
+            if output_text is None:
+                output_text = system.tokenizer.decode(output_ids, skip_special_tokens=True)
             completion_tokens = len(output_ids)
-            llm_ratio = result.get('llm_ratio', None) if isinstance(result, dict) else getattr(result, 'llm_ratio', None)
+            llm_ratio = _result_value(result, 'llm_ratio', None)
+
+        slm_token_count = _result_value(result, 'slm_token_count', 0)
+        llm_token_count = _result_value(result, 'llm_token_count', 0)
+        router_trigger_count = _result_value(result, 'router_trigger_count', llm_token_count)
+        routed_token_count = _result_value(result, 'routed_token_count', llm_token_count)
+        token_trace = _result_value(result, 'token_trace', [])
+        message_content = output_text
+        if request.trace_in_content:
+            message_content = json.dumps(
+                {
+                    "final_template": output_text,
+                    "source": "hybrid" if router_trigger_count > 0 else "slm",
+                    "router_trigger_count": router_trigger_count,
+                    "routed_token_count": routed_token_count,
+                    "token_trace": token_trace,
+                },
+                ensure_ascii=False,
+            )
         
         # Build OpenAI-compatible response
         response = ChatCompletionResponse(
@@ -335,7 +383,7 @@ async def chat_completions(request: ChatCompletionRequest):
             choices=[
                 ChatCompletionChoice(
                     index=0,
-                    message=ChatMessage(role="assistant", content=output_text),
+                    message=ChatMessage(role="assistant", content=message_content),
                     finish_reason="stop"
                 )
             ],
@@ -345,6 +393,11 @@ async def chat_completions(request: ChatCompletionRequest):
                 total_tokens=prompt_tokens + completion_tokens
             ),
             llm_ratio=llm_ratio,
+            slm_token_count=slm_token_count,
+            llm_token_count=llm_token_count,
+            router_trigger_count=router_trigger_count,
+            routed_token_count=routed_token_count,
+            token_trace=token_trace if request.return_trace else None,
         )
         
         return response

@@ -215,6 +215,43 @@ class SLMServer:
             proc.start()
             self.quick_model_procs.append(proc)
 
+    @staticmethod
+    def _init_trace_fields(req):
+        if not hasattr(req, "token_trace") or getattr(req, "token_trace", None) is None:
+            req.token_trace = []
+        req.router_trigger_count = getattr(req, "router_trigger_count", 0)
+        req.routed_token_count = getattr(req, "routed_token_count", 0)
+        req.slm_token_count = getattr(req, "slm_token_count", 0)
+        req.llm_token_count = getattr(req, "llm_token_count", 0)
+
+    @staticmethod
+    def _build_minimal_pending_trace(req, accepted_token_id=None, token_source=None, router_action=None):
+        return {
+            "step": len(getattr(req, "output_ids", [])),
+            "slm_token_id": accepted_token_id,
+            "accepted_token_id": accepted_token_id,
+            "token_source": token_source,
+            "router_action": router_action,
+            "route_probability": None,
+        }
+
+    @staticmethod
+    def _finalize_pending_trace(req, accepted_token_id, token_source, router_action):
+        SLMServer._init_trace_fields(req)
+        pending_trace = getattr(req, "_pending_route_trace", None)
+        if pending_trace is None:
+            pending_trace = SLMServer._build_minimal_pending_trace(
+                req,
+                accepted_token_id=accepted_token_id,
+                token_source=token_source,
+                router_action=router_action,
+            )
+        pending_trace["accepted_token_id"] = int(accepted_token_id) if accepted_token_id is not None else None
+        pending_trace["token_source"] = token_source
+        pending_trace["router_action"] = router_action or pending_trace.get("router_action")
+        req.token_trace.append(pending_trace)
+        req._pending_route_trace = None
+
     
     def process_new_requests(reqs: List[Req], scheduler: Scheduler, rank: int, outbound_queue: Optional[mp.Queue] = None):
         if len(reqs) == 0:
@@ -234,6 +271,7 @@ class SLMServer:
 
             req.eos_token_ids = scheduler.model_config.hf_eos_token_id
             req.vocab_size = scheduler.model_config.vocab_size
+            SLMServer._init_trace_fields(req)
             scheduler.waiting_queue.append(req)
         
         return True
@@ -491,9 +529,18 @@ class SLMServer:
             output_ids_list = []
             for i, req in enumerate(scheduler.last_batch.reqs):
                 if req.rid in returned_rid_list:
-                    if better_token_ids[req.rid] in scheduler.model_config.hf_eos_token_id:
+                    accepted_token_id = int(better_token_ids[req.rid])
+                    if accepted_token_id in scheduler.model_config.hf_eos_token_id:
                         scheduler.abort_request(AbortReq(req.rid))
-                    req.output_ids.append(better_token_ids[req.rid])
+                    req.output_ids.append(accepted_token_id)
+                    SLMServer._finalize_pending_trace(
+                        req,
+                        accepted_token_id=accepted_token_id,
+                        token_source="llm",
+                        router_action="CALL_LLM_TOKEN",
+                    )
+                    req.router_trigger_count = getattr(req, 'router_trigger_count', 0) + 1
+                    req.routed_token_count = getattr(req, 'routed_token_count', 0) + 1
                     # Track LLM token generation
                     req.llm_token_count = getattr(req, 'llm_token_count', 0) + 1
                     req.status = "need"
@@ -675,8 +722,30 @@ class SLMServer:
             token=next_token_ids[:, None],
         )
         # Use switching strategy to decide which model to use for each input
-        model_choices = router.route(model_outputs).cpu()
+        if hasattr(router, "route_with_scores"):
+            model_choices, route_scores = router.route_with_scores(model_outputs)
+        else:
+            model_choices = router.route(model_outputs)
+            route_scores = None
+        model_choices = model_choices.cpu()
+        if route_scores is not None:
+            route_scores = route_scores.detach().float().cpu()
         # TODO: merge router into sglang
+
+        for i, req in enumerate(batch.reqs):
+            SLMServer._init_trace_fields(req)
+            slm_token_id = int(next_token_ids[i].item())
+            route_probability = (
+                float(route_scores[i].item()) if route_scores is not None else None
+            )
+            req._pending_route_trace = {
+                "step": len(req.output_ids),
+                "slm_token_id": slm_token_id,
+                "accepted_token_id": None,
+                "token_source": None,
+                "router_action": "CALL_LLM_TOKEN" if model_choices[i] == 1 else "ACCEPT_SLM",
+                "route_probability": route_probability,
+            }
 
         # Check if reference model is needed for any prompt
         reference_needed = torch.any(model_choices)
@@ -749,7 +818,14 @@ class SLMServer:
                 continue
             if next_token_id in scheduler.model_config.hf_eos_token_id:
                 scheduler.abort_request(AbortReq(req.rid))
-            req.output_ids.append(next_token_id.item())
+            accepted_token_id = int(next_token_id.item())
+            req.output_ids.append(accepted_token_id)
+            SLMServer._finalize_pending_trace(
+                req,
+                accepted_token_id=accepted_token_id,
+                token_source="slm",
+                router_action="ACCEPT_SLM",
+            )
             # Track SLM token generation
             req.slm_token_count = getattr(req, 'slm_token_count', 0) + 1
             req.check_finished()
@@ -786,6 +862,23 @@ class SLMServer:
                 slm_count = getattr(req, 'slm_token_count', 0)
                 llm_count = getattr(req, 'llm_token_count', 0)
                 total_count = slm_count + llm_count
+                router_trigger_count = getattr(req, "router_trigger_count", llm_count)
+                routed_token_count = getattr(req, "routed_token_count", llm_count)
+                token_trace = []
+                for trace in getattr(req, "token_trace", []) or []:
+                    slm_token_id = trace.get("slm_token_id")
+                    accepted_token_id = trace.get("accepted_token_id")
+                    token_trace.append({
+                        "step": int(trace.get("step", 0)),
+                        "prefix": [],
+                        "slm_token": tokenizer.decode([slm_token_id], skip_special_tokens=False) if slm_token_id is not None else "",
+                        "accepted_token": tokenizer.decode([accepted_token_id], skip_special_tokens=False) if accepted_token_id is not None else "",
+                        "slm_token_id": int(slm_token_id) if slm_token_id is not None else None,
+                        "accepted_token_id": int(accepted_token_id) if accepted_token_id is not None else None,
+                        "token_source": trace.get("token_source"),
+                        "router_action": trace.get("router_action"),
+                        "route_probability": float(trace["route_probability"]) if trace.get("route_probability") is not None else None,
+                    })
                 payload = {
                     "rid": getattr(req, "rid", None),
                     "origin_input_text": getattr(req, "origin_input_text", None),
@@ -795,6 +888,9 @@ class SLMServer:
                     "status": "finished",
                     "slm_token_count": slm_count,
                     "llm_token_count": llm_count,
+                    "router_trigger_count": router_trigger_count,
+                    "routed_token_count": routed_token_count,
+                    "token_trace": token_trace,
                     "llm_ratio": llm_count / total_count if total_count > 0 else 0.0,
                 }
                 try:

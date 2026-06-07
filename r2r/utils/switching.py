@@ -42,6 +42,10 @@ class ModelSwitchingStrategy:
         """
         raise NotImplementedError
 
+    def route_with_scores(self, outputs: ModelOutputs):
+        choices = self.route(outputs)
+        return choices, None
+
 class ImmediateSwitching(ModelSwitchingStrategy):
     
     def __init__(
@@ -432,6 +436,71 @@ class NeuralSwitching(ModelSwitchingStrategy):
         
         return self.model_choices_buffer[:batch_size]
 
+    def _route_without_cuda_graph(self, outputs: ModelOutputs):
+        next_token_logits = outputs.logits[:, -1, :]  # [batch_size, vocab_size]
+            
+        # Prepare inputs based on input_type
+        inputs = {}
+            
+        # Process logits if needed
+        if "logits" in self.input_type:
+            # If the model has a logits_size parameter, use it to get top-k logits
+            if self.logits_size > 0:
+                top_logits, _ = torch.topk(
+                    next_token_logits, k=self.logits_size, dim=-1
+                )
+                inputs["logits"] = top_logits.to(
+                    device=self.device, dtype=torch.float32
+                )  # [batch_size, topk]
+            else:
+                # If no logits_size, use all logits
+                inputs["logits"] = next_token_logits.to(
+                    device=self.device, dtype=torch.float32
+                )
+            
+        # Process hidden states if needed
+        if "hidden_states" in self.input_type:
+            inputs["hidden_states"] = outputs.hidden_states[-1][:, -1, :].to(
+                device=self.device, dtype=torch.float32
+            )
+            
+        # Process token IDs if needed
+        if "token" in self.input_type:
+            inputs["token"] = outputs.token[:, -1].to(
+                device=self.device, dtype=torch.long
+            )
+
+        # Forward pass through the model with appropriate inputs
+        model_output = self.model(**inputs)
+            
+        # Handle different output formats (single output or multi-class)
+        if model_output.shape[1] == 1:
+            critical_prob = torch.sigmoid(model_output).squeeze(-1)  # [batch_size]
+            # Convert probabilities to binary decisions (0 = quick, 1 = reference)
+            model_choices = (critical_prob >= self.threshold).to(torch.int)
+        else:
+            # For multi-class output, consider class 2 as critical (divergent) cases
+            # Classes: 0=match, 1=mismatch, 2=divergent
+            probabilities = torch.softmax(model_output, dim=1)  # [batch_size, num_classes]
+            critical_prob = probabilities[:, 2]  # Get probability of class 2 (divergent)
+            model_choices = (critical_prob >= self.threshold).to(torch.int)
+            
+        # For tracking state, we'll keep the most recent decision for each input
+        self.state.last_model = "reference" if model_choices.any().item() else "quick"
+            
+        return model_choices, critical_prob
+
+    def route_with_scores(self, outputs: ModelOutputs):
+        batch_size = outputs.logits.shape[0]
+
+        with torch.no_grad():
+            if self.use_cuda_graph and batch_size in self.capture_bs:
+                model_choices = self.replay(outputs)
+                self.state.last_model = "reference" if model_choices.any().item() else "quick"
+                return model_choices, None
+
+            return self._route_without_cuda_graph(outputs)
+
     def route(self, outputs: ModelOutputs) -> torch.Tensor:
         """
         Determine which model to use for each input in the batch.
@@ -442,69 +511,8 @@ class NeuralSwitching(ModelSwitchingStrategy):
                 0 = use quick model
                 1 = use reference model
         """
-        
-        batch_size = outputs.logits.shape[0]
-
-        with torch.no_grad():
-            # Get batch size from outputs
-            if self.use_cuda_graph and batch_size in self.capture_bs:
-                model_choices = self.replay(outputs)
-                # For tracking state, we'll keep the most recent decision for each input
-                self.state.last_model = "reference" if model_choices.any().item() else "quick"
-                return model_choices
-
-            next_token_logits = outputs.logits[:, -1, :]  # [batch_size, vocab_size]
-            
-            # Prepare inputs based on input_type
-            inputs = {}
-            
-            # Process logits if needed
-            if "logits" in self.input_type:
-                # If the model has a logits_size parameter, use it to get top-k logits
-                if self.logits_size > 0:
-                    top_logits, _ = torch.topk(
-                        next_token_logits, k=self.logits_size, dim=-1
-                    )
-                    inputs["logits"] = top_logits.to(
-                        device=self.device, dtype=torch.float32
-                    )  # [batch_size, topk]
-                else:
-                    # If no logits_size, use all logits
-                    inputs["logits"] = next_token_logits.to(
-                        device=self.device, dtype=torch.float32
-                    )
-            
-            # Process hidden states if needed
-            if "hidden_states" in self.input_type:
-                inputs["hidden_states"] = outputs.hidden_states[-1][:, -1, :].to(
-                    device=self.device, dtype=torch.float32
-                )
-            
-            # Process token IDs if needed
-            if "token" in self.input_type:
-                inputs["token"] = outputs.token[:, -1].to(
-                    device=self.device, dtype=torch.long
-                )
-
-            # Forward pass through the model with appropriate inputs
-            model_output = self.model(**inputs)
-            
-            # Handle different output formats (single output or multi-class)
-            if model_output.shape[1] == 1:
-                critical_prob = torch.sigmoid(model_output).squeeze(-1)  # [batch_size]
-                # Convert probabilities to binary decisions (0 = quick, 1 = reference)
-                model_choices = (critical_prob >= self.threshold).to(torch.int)
-            else:
-                # For multi-class output, consider class 2 as critical (divergent) cases
-                # Classes: 0=match, 1=mismatch, 2=divergent
-                probabilities = torch.softmax(model_output, dim=1)  # [batch_size, num_classes]
-                critical_prob = probabilities[:, 2]  # Get probability of class 2 (divergent)
-                model_choices = (critical_prob >= self.threshold).to(torch.int)
-            
-            # For tracking state, we'll keep the most recent decision for each input
-            self.state.last_model = "reference" if model_choices.any().item() else "quick"
-            
-            return model_choices
+        model_choices, _ = self.route_with_scores(outputs)
+        return model_choices
 
 
 class NeuralRollingWindowSwitching(ModelSwitchingStrategy):
