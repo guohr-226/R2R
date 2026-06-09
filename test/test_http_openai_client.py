@@ -46,6 +46,10 @@ try:
     finish_reason = choice.finish_reason
     
     # Usage statistics
+    data = response.model_dump()
+    endpoint_usage = data.get("endpoint_usage") or data.get("model_extra", {}).get("endpoint_usage")
+    reference_usage = data.get("reference_usage") or data.get("model_extra", {}).get("reference_usage")
+    dashscope_usage = data.get("dashscope_usage") or data.get("model_extra", {}).get("dashscope_usage")
     prompt_tokens = response.usage.prompt_tokens
     completion_tokens = response.usage.completion_tokens
     total_tokens = response.usage.total_tokens
@@ -56,6 +60,12 @@ try:
     print(f"Chat completion completed in {end_time - start_time:.2f} seconds")
     print(f"Response ID: {response.id}")
     print(f"Model: {response.model}")
+    print("usage / endpoint_usage: R2R endpoint local token estimate")
+    print("reference_usage / dashscope_usage: real DashScope/Bailian API token usage")
+    print("OpenAI-compatible endpoint usage:", data.get("usage"))
+    print("Endpoint usage:", endpoint_usage)
+    print("Reference usage:", reference_usage)
+    print("DashScope usage:", dashscope_usage)
     print(f"Prompt tokens: {prompt_tokens}")
     print(f"Completion tokens: {completion_tokens}")
     print(f"Total tokens: {total_tokens}")

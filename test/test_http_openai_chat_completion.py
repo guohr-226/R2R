@@ -30,6 +30,9 @@ try:
         
         # Extract token counts from usage info
         usage = result.get("usage", {})
+        endpoint_usage = result.get("endpoint_usage", {})
+        reference_usage = result.get("reference_usage")
+        dashscope_usage = result.get("dashscope_usage")
         prompt_tokens = usage.get("prompt_tokens", 0)
         completion_tokens = usage.get("completion_tokens", 0)
         total_tokens = usage.get("total_tokens", 0)
@@ -47,6 +50,12 @@ try:
         print(f"\nGenerated text:\n{generated_text}")
 
         print(f"Chat completion completed in {end_time - start_time:.2f} seconds")
+        print("usage / endpoint_usage: R2R endpoint local token estimate")
+        print("reference_usage / dashscope_usage: real DashScope/Bailian API token usage")
+        print("OpenAI-compatible endpoint usage:", usage)
+        print("Endpoint usage:", endpoint_usage)
+        print("Reference usage:", reference_usage)
+        print("DashScope usage:", dashscope_usage)
         print(f"Prompt tokens: {prompt_tokens}, Completion tokens: {completion_tokens}, Total tokens: {total_tokens}")
         print(f"Speed: {completion_tokens/(end_time - start_time):.2f} tokens/s")
         print(f"Finish reason: {finish_reason}")

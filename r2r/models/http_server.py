@@ -80,6 +80,7 @@ class ChatCompletionResponse(BaseModel):
     router_trigger_count: Optional[int] = None
     routed_token_count: Optional[int] = None
     token_trace: Optional[List[Dict[str, Any]]] = None
+    endpoint_usage: Optional[UsageInfo] = None
     reference_usage: Optional[UsageInfo] = None
     dashscope_usage: Optional[UsageInfo] = None
 
@@ -93,7 +94,15 @@ def _result_value(result, key: str, default=None):
 def _usage_info_or_none(usage):
     if usage is None:
         return None
+    if isinstance(usage, UsageInfo):
+        return usage
     return UsageInfo(**usage)
+
+
+def _usage_info_to_dict(usage: UsageInfo) -> Dict[str, int]:
+    if hasattr(usage, "model_dump"):
+        return usage.model_dump()
+    return usage.dict()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -269,6 +278,11 @@ async def generate_request(obj: GenerateReqInput):
         token_trace = _result_value(result, 'token_trace', [])
         reference_usage = _result_value(result, 'reference_usage', None)
         dashscope_usage = _result_value(result, 'dashscope_usage', reference_usage)
+        endpoint_usage = {
+            "prompt_tokens": len(input_ids),
+            "completion_tokens": len(output_ids),
+            "total_tokens": len(input_ids) + len(output_ids),
+        }
         
         response = {
             "text": output_text,
@@ -279,6 +293,7 @@ async def generate_request(obj: GenerateReqInput):
             "llm_token_count": llm_token_count,
             "router_trigger_count": router_trigger_count,
             "routed_token_count": routed_token_count,
+            "endpoint_usage": endpoint_usage,
             "reference_usage": reference_usage,
             "dashscope_usage": dashscope_usage,
         }
@@ -376,6 +391,11 @@ async def chat_completions(request: ChatCompletionRequest):
         token_trace = _result_value(result, 'token_trace', [])
         reference_usage = _result_value(result, 'reference_usage', None)
         dashscope_usage = _result_value(result, 'dashscope_usage', reference_usage)
+        endpoint_usage = UsageInfo(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=prompt_tokens + completion_tokens
+        )
         message_content = output_text
         if request.trace_in_content:
             message_content = json.dumps(
@@ -384,6 +404,7 @@ async def chat_completions(request: ChatCompletionRequest):
                     "source": "hybrid" if router_trigger_count > 0 else "slm",
                     "router_trigger_count": router_trigger_count,
                     "routed_token_count": routed_token_count,
+                    "endpoint_usage": _usage_info_to_dict(endpoint_usage),
                     "token_trace": token_trace,
                     "reference_usage": reference_usage,
                     "dashscope_usage": dashscope_usage,
@@ -403,17 +424,14 @@ async def chat_completions(request: ChatCompletionRequest):
                     finish_reason="stop"
                 )
             ],
-            usage=UsageInfo(
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                total_tokens=prompt_tokens + completion_tokens
-            ),
+            usage=endpoint_usage,
             llm_ratio=llm_ratio,
             slm_token_count=slm_token_count,
             llm_token_count=llm_token_count,
             router_trigger_count=router_trigger_count,
             routed_token_count=routed_token_count,
             token_trace=token_trace if request.return_trace else None,
+            endpoint_usage=endpoint_usage,
             reference_usage=_usage_info_or_none(reference_usage),
             dashscope_usage=_usage_info_or_none(dashscope_usage),
         )
