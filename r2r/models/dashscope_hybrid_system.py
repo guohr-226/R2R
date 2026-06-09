@@ -72,6 +72,68 @@ class DashScopeHybridSystem:
 
         raise RuntimeError(f"reference.{value_key} or reference.{env_key} is required")
 
+    @staticmethod
+    def _usage_field(usage, key: str):
+        if usage is None:
+            return None
+        if isinstance(usage, dict):
+            return usage.get(key)
+        return getattr(usage, key, None)
+
+    @staticmethod
+    def _response_field(response, key: str, default=None):
+        if isinstance(response, dict):
+            return response.get(key, default)
+        return getattr(response, key, default)
+
+    @classmethod
+    def _response_content(cls, response) -> str:
+        choices = cls._response_field(response, "choices", []) or []
+        if not choices:
+            return ""
+        choice = choices[0]
+        message = choice.get("message") if isinstance(choice, dict) else getattr(choice, "message", None)
+        if message is None:
+            return ""
+        if isinstance(message, dict):
+            return message.get("content") or ""
+        return getattr(message, "content", None) or ""
+
+    @classmethod
+    def _parse_usage(cls, usage):
+        if usage is None:
+            return None
+
+        prompt_tokens = int(cls._usage_field(usage, "prompt_tokens") or 0)
+        completion_tokens = int(cls._usage_field(usage, "completion_tokens") or 0)
+        total_tokens = cls._usage_field(usage, "total_tokens")
+        if total_tokens is None:
+            total_tokens = prompt_tokens + completion_tokens
+        else:
+            total_tokens = int(total_tokens)
+
+        return {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+        }
+
+    @staticmethod
+    def _zero_usage():
+        return {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
+
+    @staticmethod
+    def _fallback_usage(prompt_tokens: int, completion_tokens: int):
+        return {
+            "prompt_tokens": int(prompt_tokens),
+            "completion_tokens": int(completion_tokens),
+            "total_tokens": int(prompt_tokens) + int(completion_tokens),
+        }
+
     @torch.no_grad()
     def _route_input(self, input_id: List[int]) -> str:
         input_tensor = torch.tensor([input_id], device=self.device, dtype=torch.long)
@@ -97,7 +159,7 @@ class DashScopeHybridSystem:
         max_new_tokens: int,
         temperature: float,
         top_p: float,
-    ) -> str:
+    ) -> Dict:
         response = await self.client.chat.completions.create(
             model=self.reference_model_name,
             messages=messages,
@@ -105,7 +167,10 @@ class DashScopeHybridSystem:
             top_p=top_p,
             max_tokens=max_new_tokens,
         )
-        return response.choices[0].message.content or ""
+        return {
+            "content": self._response_content(response),
+            "usage": self._parse_usage(self._response_field(response, "usage")),
+        }
 
     def encode_messages(self, messages: List[Dict[str, str]]) -> List[int]:
         try:
@@ -159,13 +224,18 @@ class DashScopeHybridSystem:
         input_id = self.encode_messages(messages)
         selected_model = self._route_input(input_id)
         if selected_model == "reference":
-            output_text = await self._generate_dashscope(
+            dashscope_result = await self._generate_dashscope(
                 messages=messages,
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
                 top_p=top_p,
             )
+            output_text = dashscope_result["content"]
             output_ids = self.tokenizer.encode(output_text, add_special_tokens=False)
+            reference_usage = dashscope_result["usage"] or self._fallback_usage(
+                prompt_tokens=len(input_id),
+                completion_tokens=len(output_ids),
+            )
         else:
             output_ids = self._generate_quick(
                 input_id=input_id,
@@ -175,12 +245,21 @@ class DashScopeHybridSystem:
                 top_k=top_k,
             )
             output_text = self.tokenizer.decode(output_ids, skip_special_tokens=True)
+            reference_usage = self._zero_usage()
+
+        llm_completion_tokens = reference_usage["completion_tokens"] if selected_model == "reference" else 0
 
         return {
             "output_ids": output_ids,
             "output_text": output_text,
             "source_model": selected_model,
             "llm_ratio": 1.0 if selected_model == "reference" else 0.0,
+            "reference_usage": reference_usage,
+            "dashscope_usage": reference_usage,
+            "slm_token_count": 0 if selected_model == "reference" else len(output_ids),
+            "llm_token_count": llm_completion_tokens,
+            "router_trigger_count": 1 if selected_model == "reference" else 0,
+            "routed_token_count": llm_completion_tokens,
         }
 
     async def generate_one_request(
@@ -195,13 +274,18 @@ class DashScopeHybridSystem:
         selected_model = self._route_input(input_id)
         if selected_model == "reference":
             prompt_text = self.tokenizer.decode(input_id, skip_special_tokens=False)
-            output_text = await self._generate_dashscope(
+            dashscope_result = await self._generate_dashscope(
                 messages=[{"role": "user", "content": prompt_text}],
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
                 top_p=top_p,
             )
+            output_text = dashscope_result["content"]
             output_ids = self.tokenizer.encode(output_text, add_special_tokens=False)
+            reference_usage = dashscope_result["usage"] or self._fallback_usage(
+                prompt_tokens=len(input_id),
+                completion_tokens=len(output_ids),
+            )
         else:
             output_ids = self._generate_quick(
                 input_id=input_id,
@@ -211,10 +295,19 @@ class DashScopeHybridSystem:
                 top_k=top_k,
             )
             output_text = self.tokenizer.decode(output_ids, skip_special_tokens=True)
+            reference_usage = self._zero_usage()
+
+        llm_completion_tokens = reference_usage["completion_tokens"] if selected_model == "reference" else 0
 
         return {
             "output_ids": output_ids,
             "output_text": output_text,
             "source_model": selected_model,
             "llm_ratio": 1.0 if selected_model == "reference" else 0.0,
+            "reference_usage": reference_usage,
+            "dashscope_usage": reference_usage,
+            "slm_token_count": 0 if selected_model == "reference" else len(output_ids),
+            "llm_token_count": llm_completion_tokens,
+            "router_trigger_count": 1 if selected_model == "reference" else 0,
+            "routed_token_count": llm_completion_tokens,
         }

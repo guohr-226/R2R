@@ -80,12 +80,20 @@ class ChatCompletionResponse(BaseModel):
     router_trigger_count: Optional[int] = None
     routed_token_count: Optional[int] = None
     token_trace: Optional[List[Dict[str, Any]]] = None
+    reference_usage: Optional[UsageInfo] = None
+    dashscope_usage: Optional[UsageInfo] = None
 
 
 def _result_value(result, key: str, default=None):
     if isinstance(result, dict):
         return result.get(key, default)
     return getattr(result, key, default)
+
+
+def _usage_info_or_none(usage):
+    if usage is None:
+        return None
+    return UsageInfo(**usage)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -259,6 +267,8 @@ async def generate_request(obj: GenerateReqInput):
         router_trigger_count = _result_value(result, 'router_trigger_count', llm_token_count)
         routed_token_count = _result_value(result, 'routed_token_count', llm_token_count)
         token_trace = _result_value(result, 'token_trace', [])
+        reference_usage = _result_value(result, 'reference_usage', None)
+        dashscope_usage = _result_value(result, 'dashscope_usage', reference_usage)
         
         response = {
             "text": output_text,
@@ -269,6 +279,8 @@ async def generate_request(obj: GenerateReqInput):
             "llm_token_count": llm_token_count,
             "router_trigger_count": router_trigger_count,
             "routed_token_count": routed_token_count,
+            "reference_usage": reference_usage,
+            "dashscope_usage": dashscope_usage,
         }
         if obj.display_progress or obj.return_trace:
             response["token_trace"] = token_trace
@@ -362,6 +374,8 @@ async def chat_completions(request: ChatCompletionRequest):
         router_trigger_count = _result_value(result, 'router_trigger_count', llm_token_count)
         routed_token_count = _result_value(result, 'routed_token_count', llm_token_count)
         token_trace = _result_value(result, 'token_trace', [])
+        reference_usage = _result_value(result, 'reference_usage', None)
+        dashscope_usage = _result_value(result, 'dashscope_usage', reference_usage)
         message_content = output_text
         if request.trace_in_content:
             message_content = json.dumps(
@@ -371,6 +385,8 @@ async def chat_completions(request: ChatCompletionRequest):
                     "router_trigger_count": router_trigger_count,
                     "routed_token_count": routed_token_count,
                     "token_trace": token_trace,
+                    "reference_usage": reference_usage,
+                    "dashscope_usage": dashscope_usage,
                 },
                 ensure_ascii=False,
             )
@@ -398,6 +414,8 @@ async def chat_completions(request: ChatCompletionRequest):
             router_trigger_count=router_trigger_count,
             routed_token_count=routed_token_count,
             token_trace=token_trace if request.return_trace else None,
+            reference_usage=_usage_info_or_none(reference_usage),
+            dashscope_usage=_usage_info_or_none(dashscope_usage),
         )
         
         return response
