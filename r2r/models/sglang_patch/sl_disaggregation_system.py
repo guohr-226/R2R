@@ -12,15 +12,29 @@ from transformers import AutoTokenizer
 import threading
 import asyncio
 import os
+import queue
 from multiprocessing import Value
 
 
 def find_free_port() -> int:
     """Find and return a free port on the system."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("", 0))
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
+
+
+def _master_port_retries() -> int:
+    value = os.environ.get("R2R_MASTER_PORT_RETRIES", "8")
+    try:
+        retries = int(value)
+    except ValueError:
+        retries = 8
+    return max(retries, 1)
+
+
+def _is_addr_in_use_error(error: BaseException) -> bool:
+    text = repr(error).lower()
+    return "eaddrinuse" in text or "address already in use" in text
 
 
 from r2r.models.recorder import GenerationRecord, GenerationRecorder
@@ -44,6 +58,15 @@ from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.configs.model_config import ModelConfig
 
 import r2r.models.sglang_patch.patch
+
+
+def _debug_hang_enabled() -> bool:
+    return os.environ.get("R2R_DEBUG_HANG", "").lower() in {"1", "true", "yes", "on"}
+
+
+def _debug_hang(message: str) -> None:
+    if _debug_hang_enabled():
+        print(f"[R2R_DEBUG_HANG][system] {message}", flush=True)
 
 
 def get_mem_fraction_statics(
@@ -214,12 +237,6 @@ class SLDisaggregationSystem:
         self.req_sender = self.zmq_ctx.socket(zmq.PUB)
         self.req_port = self.req_sender.bind_to_random_port("tcp://127.0.0.1")
 
-        self._quick_ready_queue = mp.Queue()
-
-        # Compute MASTER_PORT once in the main process and pass to workers
-        self.slm_master_port = find_free_port()
-        print(f"[SLDisaggregationSystem] SLM MASTER_ADDR: localhost, MASTER_PORT: {self.slm_master_port}")
-
         small_mem_fraction_static, large_mem_fraction_static = get_mem_fraction_statics(
             model_config=self.model_config,
             overlap_tp_schedule=overlap_tp_schedule,
@@ -245,76 +262,152 @@ class SLDisaggregationSystem:
         # Launch quick model workers with req_port(port that receive Req objects)
         # Inter-server queues (Q2): create before servers so workers can use them
         # Instantiate SLMServer first (it binds its PUB for SLM->LLM)
-        self.slm_server = SLMServer(
-            model_config=self.model_config,
-            quick_sglang_kwargs=quick_sglang_kwargs,
-            quick_num_gpus=self.quick_num_gpus,
-            quick_base_gpu_id=self.quick_base_gpu_id,
-            req_port=self.req_port,
-            ready_queue=self._quick_ready_queue,
-            switching_strategy=self.switching_strategy,
-            strategy_kwargs=self.strategy_kwargs,
-            mem_fraction_static=small_mem_fraction_static,
-            llm_kvcache_size=self.llm_kvcache_size,
-            master_port=self.slm_master_port,  # Pass master_port to SLMServer
-        )
+        max_quick_port_attempts = _master_port_retries()
+        for attempt in range(max_quick_port_attempts):
+            self._quick_ready_queue = mp.Queue()
+            self.slm_master_port = find_free_port()
+            print(
+                "[SLDisaggregationSystem] SLM MASTER_ADDR: 127.0.0.1, "
+                f"MASTER_PORT: {self.slm_master_port}"
+            )
+            self.slm_server = None
+            try:
+                self.slm_server = SLMServer(
+                    model_config=self.model_config,
+                    quick_sglang_kwargs={**quick_sglang_kwargs},
+                    quick_num_gpus=self.quick_num_gpus,
+                    quick_base_gpu_id=self.quick_base_gpu_id,
+                    req_port=self.req_port,
+                    ready_queue=self._quick_ready_queue,
+                    switching_strategy=self.switching_strategy,
+                    strategy_kwargs=self.strategy_kwargs,
+                    mem_fraction_static=small_mem_fraction_static,
+                    llm_kvcache_size=self.llm_kvcache_size,
+                    master_port=self.slm_master_port,
+                )
 
-        try:
-            got = 0
-            tok = None
-            while got < self.quick_num_gpus:
-                msg, rank, payload = self._quick_ready_queue.get(timeout=120)
-                if msg != "READY":
-                    raise RuntimeError(f"unexpected ready msg: {msg}")
-                if tok is None and payload is not None:
-                    tok = payload
-                got += 1
-            assert tok is not None, "Failed to get tokenizer from quick model scheduler"
-            self.tokenizer = tok
-        except Exception as e:
-            raise RuntimeError("Waiting for SLMServer launching or Failed to get tokenizer from scheduler") from e
+                got = 0
+                tok = None
+                deadline = time.monotonic() + 120
+                while got < self.quick_num_gpus:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise RuntimeError("Timed out waiting for quick model workers to become READY")
+                    try:
+                        msg, rank, payload = self._quick_ready_queue.get(timeout=min(1.0, remaining))
+                    except queue.Empty:
+                        failed = [
+                            (p.pid, p.exitcode)
+                            for p in getattr(self.slm_server, "quick_model_procs", [])
+                            if p.exitcode not in (None, 0)
+                        ]
+                        if failed:
+                            raise RuntimeError(
+                                f"Quick model worker exited before READY: {failed}"
+                            )
+                        continue
+                    if msg == "ERROR":
+                        raise RuntimeError(f"Quick model worker rank {rank} failed: {payload}")
+                    if msg != "READY":
+                        raise RuntimeError(f"unexpected ready msg: {msg}")
+                    if tok is None and payload is not None:
+                        tok = payload
+                    got += 1
+                assert tok is not None, "Failed to get tokenizer from quick model scheduler"
+                self.tokenizer = tok
+                break
+            except Exception as e:
+                if self.slm_server is not None:
+                    self.slm_server.shutdown()
+                    self.slm_server = None
+                should_retry = _is_addr_in_use_error(e) and attempt + 1 < max_quick_port_attempts
+                if should_retry:
+                    print(
+                        "[SLDisaggregationSystem] SLM MASTER_PORT was occupied; "
+                        "retrying with a new port..."
+                    )
+                    continue
+                raise RuntimeError(
+                    "Waiting for SLMServer launching or Failed to get tokenizer from scheduler"
+                ) from e
 
 
         # Launch reference model workers
-        self._llm_ready_queue = mp.Queue()
-        self.llm_server = LLMServer(
-            model_config=self.model_config,
-            reference_sglang_kwargs=reference_sglang_kwargs,
-            quick_num_gpus=self.quick_num_gpus,
-            reference_base_gpu_id=self.reference_base_gpu_id,
-            reference_num_gpus=self.reference_num_gpus,
-            reference_master_port=find_free_port(),
-            ready_queue=self._llm_ready_queue,
-            overlap_tp_schedule=overlap_tp_schedule,
-            mem_fraction_static=large_mem_fraction_static,
-            llm_kvcache_size=self.llm_kvcache_size,
-            min_batch_size=llm_min_batch_size,
-        )
+        max_reference_port_attempts = _master_port_retries()
+        for attempt in range(max_reference_port_attempts):
+            self._llm_ready_queue = mp.Queue()
+            reference_master_port = find_free_port()
+            self.llm_server = None
+            try:
+                self.llm_server = LLMServer(
+                    model_config=self.model_config,
+                    reference_sglang_kwargs={**reference_sglang_kwargs},
+                    quick_num_gpus=self.quick_num_gpus,
+                    reference_base_gpu_id=self.reference_base_gpu_id,
+                    reference_num_gpus=self.reference_num_gpus,
+                    reference_master_port=reference_master_port,
+                    ready_queue=self._llm_ready_queue,
+                    overlap_tp_schedule=overlap_tp_schedule,
+                    mem_fraction_static=large_mem_fraction_static,
+                    llm_kvcache_size=self.llm_kvcache_size,
+                    min_batch_size=llm_min_batch_size,
+                )
 
-        try:
-            # Wait LLM workers
-            got_llm = 0
-            ref_tok = None
-            while got_llm < self.reference_num_gpus:
-                ready_msg = self._llm_ready_queue.get(timeout=300)
-                # Compatible with formats: (msg, rank) or (msg, rank, tokenizer)
-                if len(ready_msg) == 2:
-                    msg, rank = ready_msg
-                    tk = None
-                else:
-                    msg, rank, tk = ready_msg
-                if msg != "READY":
-                    raise RuntimeError(f"unexpected llm ready msg: {msg}")
-                if ref_tok is None and tk is not None:
-                    ref_tok = tk
-                got_llm += 1
-            if ref_tok is None:
-                raise RuntimeError("Failed to get tokenizer from LLMServer rank0")
-            self.reference_tokenizer = ref_tok
-            self._llm_all_ready = True
-            print(f"[SLDisaggregationSystem] llm READY={got_llm}")
-        except Exception as e:
-            raise RuntimeError("Waiting for reference model workers launching failed") from e
+                # Wait LLM workers
+                got_llm = 0
+                ref_tok = None
+                deadline = time.monotonic() + 300
+                while got_llm < self.reference_num_gpus:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise RuntimeError("Timed out waiting for reference model workers to become READY")
+                    try:
+                        ready_msg = self._llm_ready_queue.get(timeout=min(1.0, remaining))
+                    except queue.Empty:
+                        failed = [
+                            (p.pid, p.exitcode)
+                            for p in getattr(self.llm_server, "reference_model_procs", [])
+                            if p.exitcode not in (None, 0)
+                        ]
+                        if failed:
+                            raise RuntimeError(
+                                f"Reference model worker exited before READY: {failed}"
+                            )
+                        continue
+                    # Compatible with formats: (msg, rank) or (msg, rank, tokenizer)
+                    if len(ready_msg) == 2:
+                        msg, rank = ready_msg
+                        tk = None
+                    else:
+                        msg, rank, tk = ready_msg
+                    if msg == "ERROR":
+                        raise RuntimeError(f"Reference model worker rank {rank} failed: {tk}")
+                    if msg != "READY":
+                        raise RuntimeError(f"unexpected llm ready msg: {msg}")
+                    if ref_tok is None and tk is not None:
+                        ref_tok = tk
+                    got_llm += 1
+                if ref_tok is None:
+                    raise RuntimeError("Failed to get tokenizer from LLMServer rank0")
+                self.reference_tokenizer = ref_tok
+                self._llm_all_ready = True
+                print(f"[SLDisaggregationSystem] llm READY={got_llm}")
+                break
+            except Exception as e:
+                if self.llm_server is not None:
+                    self.llm_server.shutdown()
+                    self.llm_server = None
+                should_retry = _is_addr_in_use_error(e) and attempt + 1 < max_reference_port_attempts
+                if should_retry:
+                    print(
+                        "[SLDisaggregationSystem] reference MASTER_PORT was occupied; "
+                        "retrying with a new port..."
+                    )
+                    continue
+                if self.slm_server is not None:
+                    self.slm_server.shutdown()
+                    self.slm_server = None
+                raise RuntimeError("Waiting for reference model workers launching failed") from e
 
         if self.tokenizer is None:
             self.tokenizer = self.reference_tokenizer
@@ -563,6 +656,11 @@ class SLDisaggregationSystem:
         )
 
         rid = self.get_rid()
+        start_time = time.monotonic()
+        _debug_hang(
+            f"submit rid={rid} input_len={len(input_id)} max_new_tokens={max_new_tokens} "
+            f"temperature={temperature} top_p={top_p} top_k={top_k}"
+        )
         
         req = Req(
             rid=rid,
@@ -583,11 +681,30 @@ class SLDisaggregationSystem:
             await asyncio.sleep(0.01)
             self.req_sender.send_pyobj(req)
 
-        # Wait asynchronously until the rid appears in finished map
-        while True:
-            if rid in self.finished_reqs:
-                return self.finished_reqs[rid]
-            await asyncio.sleep(0.01) # Non-blocking wait
+        try:
+            # Wait asynchronously until the rid appears in finished map
+            last_report_time = start_time
+            while True:
+                if rid in self.finished_reqs:
+                    elapsed = time.monotonic() - start_time
+                    result = self.finished_reqs[rid]
+                    output_ids = result.get("output_ids", []) if isinstance(result, dict) else getattr(result, "output_ids", [])
+                    _debug_hang(
+                        f"finished rid={rid} elapsed={elapsed:.2f}s output_len={len(output_ids)} "
+                        f"finished_reqs={len(self.finished_reqs)}"
+                    )
+                    return self.finished_reqs[rid]
+                now = time.monotonic()
+                if now - last_report_time >= 10.0:
+                    _debug_hang(
+                        f"waiting rid={rid} elapsed={now - start_time:.2f}s "
+                        f"finished_reqs={len(self.finished_reqs)}"
+                    )
+                    last_report_time = now
+                await asyncio.sleep(0.01) # Non-blocking wait
+        except asyncio.CancelledError:
+            self.abort_request(rid)
+            raise
 
     async def generate_batch_requests(
         self,
@@ -625,6 +742,18 @@ class SLDisaggregationSystem:
                 pass
 
         return results
+
+    def abort_request(self, rid: str) -> None:
+        _debug_hang(f"abort rid={rid}")
+        try:
+            self.req_sender.send_pyobj(AbortReq(rid), flags=zmq.NOBLOCK)
+        except zmq.Again:
+            try:
+                self.req_sender.send_pyobj(AbortReq(rid))
+            except Exception:
+                pass
+        except Exception:
+            pass
 
     def reset_cache_simple(self):
         """Reset the cache for the quick model"""

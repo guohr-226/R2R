@@ -3,6 +3,7 @@ os.environ["SGLANG_ENABLE_TORCH_COMPILE"] = "0"
 os.environ["SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK"] = "1"
 
 import argparse
+import asyncio
 import json
 import logging
 import uvicorn
@@ -47,7 +48,7 @@ class ChatCompletionRequest(BaseModel):
     messages: List[ChatMessage]
     temperature: Optional[float] = 1.0
     top_p: Optional[float] = 1.0
-    max_tokens: Optional[int] = 2048
+    max_tokens: Optional[int] = 128
     stream: Optional[bool] = False
     stop: Optional[Union[str, List[str]]] = None
     n: Optional[int] = 1
@@ -104,6 +105,30 @@ def _usage_info_to_dict(usage: UsageInfo) -> Dict[str, int]:
         return usage.model_dump()
     return usage.dict()
 
+
+def _apply_chat_template(tokenizer, messages):
+    template_kwargs = {
+        "add_generation_prompt": True,
+        "tokenize": True,
+    }
+    try:
+        return tokenizer.apply_chat_template(
+            messages,
+            enable_thinking=False,
+            **template_kwargs,
+        )
+    except TypeError:
+        return tokenizer.apply_chat_template(messages, **template_kwargs)
+
+
+def _request_timeout_seconds() -> float:
+    value = os.environ.get("R2R_HTTP_REQUEST_TIMEOUT_SEC", "120")
+    try:
+        timeout = float(value)
+    except ValueError:
+        timeout = 120.0
+    return max(timeout, 1.0)
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global system
@@ -157,6 +182,7 @@ async def lifespan(app: FastAPI):
             "trust_remote_code",
             "max_prefill_tokens",
             "max_total_tokens",
+            "chunked_prefill_size",
             "kv_cache_dtype",
             "skip_server_warmup",
             "schedule_conservativeness",
@@ -257,13 +283,16 @@ async def generate_request(obj: GenerateReqInput):
         if sampling_params is None:
             sampling_params = default_sampling_params
         
-        result = await system.generate_one_request(
-            input_id=input_ids,
-            max_new_tokens=sampling_params.get('max_new_tokens', 128),
-            temperature=sampling_params.get('temperature', 1.0),
-            top_p=sampling_params.get('top_p', 1.0),
-            top_k=sampling_params.get('top_k', -1),
-            display_progress=obj.display_progress
+        result = await asyncio.wait_for(
+            system.generate_one_request(
+                input_id=input_ids,
+                max_new_tokens=sampling_params.get('max_new_tokens', 128),
+                temperature=sampling_params.get('temperature', 1.0),
+                top_p=sampling_params.get('top_p', 1.0),
+                top_k=sampling_params.get('top_k', -1),
+                display_progress=obj.display_progress
+            ),
+            timeout=_request_timeout_seconds(),
         )
         
         
@@ -301,6 +330,9 @@ async def generate_request(obj: GenerateReqInput):
             response["token_trace"] = token_trace
         return response
 
+    except asyncio.TimeoutError:
+        logger.error("Generation timed out")
+        raise HTTPException(status_code=504, detail="Generation timed out")
     except Exception as e:
         logger.error(f"Generation failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -322,12 +354,15 @@ async def chat_completions(request: ChatCompletionRequest):
         messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
         
         if hasattr(system, "generate_chat_completion"):
-            result = await system.generate_chat_completion(
-                messages=messages,
-                max_new_tokens=request.max_tokens or 2048,
-                temperature=request.temperature if request.temperature is not None else 1.0,
-                top_p=request.top_p if request.top_p is not None else 1.0,
-                top_k=-1,
+            result = await asyncio.wait_for(
+                system.generate_chat_completion(
+                    messages=messages,
+                    max_new_tokens=request.max_tokens or 2048,
+                    temperature=request.temperature if request.temperature is not None else 1.0,
+                    top_p=request.top_p if request.top_p is not None else 1.0,
+                    top_k=-1,
+                ),
+                timeout=_request_timeout_seconds(),
             )
             input_ids = system.encode_messages(messages)
             output_ids = _result_value(result, "output_ids", [])
@@ -340,11 +375,7 @@ async def chat_completions(request: ChatCompletionRequest):
         else:
             # Apply chat template if available
             if hasattr(system.tokenizer, 'apply_chat_template'):
-                input_ids = system.tokenizer.apply_chat_template(
-                    messages, 
-                    add_generation_prompt=True,
-                    tokenize=True
-                )
+                input_ids = _apply_chat_template(system.tokenizer, messages)
             else:
                 # Fallback: concatenate messages
                 text = "\n".join([f"{msg['role']}: {msg['content']}" for msg in messages])
@@ -367,13 +398,16 @@ async def chat_completions(request: ChatCompletionRequest):
                 sampling_params["max_new_tokens"] = request.max_tokens
 
             # Generate response
-            result = await system.generate_one_request(
-                input_id=input_ids,
-                max_new_tokens=sampling_params["max_new_tokens"],
-                temperature=sampling_params["temperature"],
-                top_p=sampling_params["top_p"],
-                top_k=sampling_params["top_k"],
-                display_progress=False
+            result = await asyncio.wait_for(
+                system.generate_one_request(
+                    input_id=input_ids,
+                    max_new_tokens=sampling_params["max_new_tokens"],
+                    temperature=sampling_params["temperature"],
+                    top_p=sampling_params["top_p"],
+                    top_k=sampling_params["top_k"],
+                    display_progress=False
+                ),
+                timeout=_request_timeout_seconds(),
             )
             
             # Extract output
@@ -438,6 +472,9 @@ async def chat_completions(request: ChatCompletionRequest):
         
         return response
     
+    except asyncio.TimeoutError:
+        logger.error("Chat completion timed out")
+        raise HTTPException(status_code=504, detail="Chat completion timed out")
     except Exception as e:
         logger.error(f"Chat completion failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))

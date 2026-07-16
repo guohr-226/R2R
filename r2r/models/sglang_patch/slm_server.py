@@ -36,6 +36,123 @@ from r2r.utils.sampling import sample_token
 from r2r.models.sglang_patch.schedule_req import WaitingReq, SimpleSamplingParams
 
 
+def _debug_hang_enabled() -> bool:
+    return os.environ.get("R2R_DEBUG_HANG", "").lower() in {"1", "true", "yes", "on"}
+
+
+def _debug_hang(message: str) -> None:
+    if _debug_hang_enabled():
+        print(f"[R2R_DEBUG_HANG][slm] {message}", flush=True)
+
+
+def _rid_matches(req_rid, abort_rid: str) -> bool:
+    return bool(abort_rid) and str(req_rid).startswith(abort_rid)
+
+
+def _remove_issued_req_by_rid(scheduler: Scheduler, rid: str) -> bool:
+    issued_reqs = getattr(scheduler, "issued_reqs", None)
+    if issued_reqs is None:
+        return False
+    removed = False
+    for issued_req in list(issued_reqs):
+        if _rid_matches(getattr(issued_req, "rid", ""), rid):
+            try:
+                issued_reqs.remove(issued_req)
+                removed = True
+            except Exception:
+                pass
+    return removed
+
+
+def _abort_batch(scheduler: Scheduler, batch, abort_req: AbortReq) -> int:
+    if batch is None:
+        return 0
+    keep_indices = []
+    removed = 0
+    for i, req in enumerate(list(batch.reqs)):
+        if abort_req.abort_all or _rid_matches(getattr(req, "rid", ""), abort_req.rid):
+            try:
+                req.to_abort = True
+                req.to_abort_message = "Aborted by AbortReq."
+                req.check_finished()
+            except Exception:
+                pass
+            try:
+                scheduler.tree_cache.cache_finished_req(req)
+            except Exception:
+                pass
+            _remove_issued_req_by_rid(scheduler, getattr(req, "rid", ""))
+            removed += 1
+        else:
+            keep_indices.append(i)
+    if removed:
+        batch.filter_batch(keep_indices=keep_indices)
+        try:
+            batch.batch_is_full = False
+        except Exception:
+            pass
+    return removed
+
+
+def _abort_scheduler_request(scheduler: Scheduler, abort_req: AbortReq) -> Dict[str, int]:
+    removed = {
+        "waiting_queue": 0,
+        "running_batch": 0,
+        "last_batch": 0,
+        "batch_not_need": 0,
+        "cur_batch": 0,
+        "issued_reqs": 0,
+        "chunked_req": 0,
+    }
+
+    waiting_queue = getattr(scheduler, "waiting_queue", None)
+    if waiting_queue is not None:
+        kept = []
+        for req in list(waiting_queue):
+            if abort_req.abort_all or _rid_matches(getattr(req, "rid", ""), abort_req.rid):
+                removed["waiting_queue"] += 1
+                _remove_issued_req_by_rid(scheduler, getattr(req, "rid", ""))
+            else:
+                kept.append(req)
+        scheduler.waiting_queue = kept
+
+    seen_batches = set()
+    for attr in ("running_batch", "last_batch", "batch_not_need", "cur_batch"):
+        batch = getattr(scheduler, attr, None)
+        if batch is None or id(batch) in seen_batches:
+            continue
+        seen_batches.add(id(batch))
+        removed[attr] += _abort_batch(scheduler, batch, abort_req)
+
+    chunked_req = getattr(scheduler, "chunked_req", None)
+    if chunked_req is not None and (
+        abort_req.abort_all or _rid_matches(getattr(chunked_req, "rid", ""), abort_req.rid)
+    ):
+        try:
+            scheduler.tree_cache.cache_finished_req(chunked_req)
+        except Exception:
+            pass
+        _remove_issued_req_by_rid(scheduler, getattr(chunked_req, "rid", ""))
+        scheduler.chunked_req = None
+        removed["chunked_req"] = 1
+
+    if abort_req.abort_all:
+        issued_reqs = getattr(scheduler, "issued_reqs", None)
+        if issued_reqs is not None:
+            removed["issued_reqs"] += len(issued_reqs)
+            issued_reqs.clear()
+    elif _remove_issued_req_by_rid(scheduler, abort_req.rid):
+        removed["issued_reqs"] += 1
+
+    running_batch = getattr(scheduler, "running_batch", None)
+    if running_batch is not None:
+        try:
+            running_batch.batch_is_full = False
+        except Exception:
+            pass
+    return removed
+
+
 class SLMServer:
     """SLM Server launched by SGLang"""
     def __init__(
@@ -257,6 +374,22 @@ class SLMServer:
         if len(reqs) == 0:
             return
         for req in reqs:
+            if isinstance(req, AbortReq):
+                removed = _abort_scheduler_request(scheduler, req)
+                try:
+                    scheduler.abort_request(req)
+                except Exception:
+                    pass
+                _debug_hang(
+                    f"rank={rank} abort rid={req.rid} abort_all={req.abort_all} "
+                    f"removed={removed}"
+                )
+                if rank == 0 and outbound_queue is not None:
+                    try:
+                        outbound_queue.put_nowait([WaitingReq(rid=req.rid, new_token_ids=[], status="ABORT")])
+                    except Exception:
+                        pass
+                continue
             if req.status in ("SHUTDOWN", "RESET_CACHE"):
                 if req.status == "SHUTDOWN":
                     if rank == 0:
@@ -298,13 +431,27 @@ class SLMServer:
         signal.signal(signal.SIGTERM, _worker_sig_handler)
         
         # Set MASTER_ADDR and MASTER_PORT inside worker
-        os.environ["MASTER_ADDR"] = "localhost"
+        os.environ["MASTER_ADDR"] = "127.0.0.1"
         if master_port is not None:
             os.environ["MASTER_PORT"] = str(master_port)
         elif "MASTER_PORT" not in os.environ:
             raise RuntimeError("MASTER_PORT must be provided or set in environment")
-        
-        dist.init_process_group(backend='nccl', rank=rank, world_size=world_size)
+
+        init_method = f"tcp://127.0.0.1:{os.environ['MASTER_PORT']}"
+        try:
+            dist.init_process_group(
+                backend='nccl',
+                init_method=init_method,
+                rank=rank,
+                world_size=world_size,
+            )
+        except Exception as e:
+            if ready_queue is not None:
+                try:
+                    ready_queue.put(("ERROR", rank, repr(e)))
+                except Exception:
+                    pass
+            raise
         gpu_id = base_gpu_id + rank
         torch.cuda.set_device(gpu_id)
 
@@ -515,6 +662,21 @@ class SLMServer:
             scheduler.n_generated_tokens += len(commit_msgs)
         better_token_ids = {}
         returned_rid_list = []
+        if _debug_hang_enabled():
+            msg_summary = [
+                (
+                    getattr(waiting_req, "rid", None),
+                    getattr(waiting_req, "status", None),
+                    len(getattr(waiting_req, "new_token_ids", []) or []),
+                )
+                for waiting_req in commit_msgs
+            ]
+            last_rids = [getattr(req, "rid", None) for req in getattr(getattr(scheduler, "last_batch", None), "reqs", [])]
+            notneed_rids = [getattr(req, "rid", None) for req in getattr(getattr(scheduler, "batch_not_need", None), "reqs", [])]
+            _debug_hang(
+                f"rank={rank} recv_from_llm msgs={msg_summary} "
+                f"last_batch_rids={last_rids} batch_not_need_rids={notneed_rids}"
+            )
         for waiting_req in commit_msgs:
             better_token_ids[waiting_req.rid] = waiting_req.new_token_ids[-1]
             returned_rid_list.append(waiting_req.rid)
@@ -523,9 +685,16 @@ class SLMServer:
         finished_reqs = []
         if scheduler.batch_not_need is not None:
             if scheduler.last_batch is None:
+                _debug_hang(f"rank={rank} recv_from_llm dropped: last_batch is None returned={returned_rid_list}")
                 return
             else:
                 scheduler.last_batch.merge_batch(scheduler.batch_not_need)
+            merged_rids = [getattr(req, "rid", None) for req in scheduler.last_batch.reqs]
+            unmatched_rids = [rid for rid in returned_rid_list if rid not in merged_rids]
+            if unmatched_rids:
+                _debug_hang(
+                    f"rank={rank} recv_from_llm unmatched_rids={unmatched_rids} merged_rids={merged_rids}"
+                )
             output_ids_list = []
             for i, req in enumerate(scheduler.last_batch.reqs):
                 if req.rid in returned_rid_list:
@@ -545,6 +714,10 @@ class SLMServer:
                     req.llm_token_count = getattr(req, 'llm_token_count', 0) + 1
                     req.status = "need"
                     req.check_finished()
+                    _debug_hang(
+                        f"rank={rank} accept_llm rid={req.rid} token={accepted_token_id} "
+                        f"output_len={len(req.output_ids)} finished={req.finished()}"
+                    )
                     if req.finished():
                         scheduler.tree_cache.cache_finished_req(req)
                         finished_reqs.append(req)
@@ -753,6 +926,9 @@ class SLMServer:
         if reference_needed:
             for i, req in enumerate(batch.reqs):
                 if model_choices[i] == 1:
+                    current_route_probability = (
+                        float(route_scores[i].item()) if route_scores is not None else None
+                    )
                     # TODO: send origin input to LLM to prefill prefix only
                     req.status = "notneed"
                     new_token_ids = []
@@ -772,6 +948,11 @@ class SLMServer:
                             )
                         )
                     req_to_send.append(waiting_req)
+                    _debug_hang(
+                        f"route_to_llm rid={req.rid} output_len={len(req.output_ids)} "
+                        f"send_token_len={len(new_token_ids)} last_llm_loc={req.last_llm_loc} "
+                        f"route_probability={current_route_probability}"
+                    )
         return result, req_to_send
 
     @staticmethod
@@ -841,12 +1022,20 @@ class SLMServer:
         if len(req_to_send) > 0:
             scheduler.check_batch_status(batch)
             if rank == 0:
+                _debug_hang(
+                    f"rank={rank} send_to_llm rids={[req.rid for req in req_to_send]} "
+                    f"batch_not_need_rids={[req.rid for req in scheduler.batch_not_need.reqs]}"
+                )
                 outbound_queue.put_nowait(req_to_send)
 
     @staticmethod
     def process_finished_requests(finished_reqs: List[Req], tokenizer, finished_queue: Optional[mp.Queue] = None, outbound_queue: Optional[mp.Queue] = None):
         """Process finished requests, e.g., logging or updating status."""
         for req in finished_reqs:
+            _debug_hang(
+                f"finish rid={req.rid} output_len={len(getattr(req, 'output_ids', []))} "
+                f"slm_tokens={getattr(req, 'slm_token_count', 0)} llm_tokens={getattr(req, 'llm_token_count', 0)}"
+            )
             #print(f"Request {req.rid} finished")
             #print(f"You: {req.origin_input_text}")
             #print(f"Bot: {tokenizer.decode(req.output_ids)}")

@@ -39,6 +39,148 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.utils import broadcast_pyobj
 
+
+def _debug_hang_enabled() -> bool:
+    return os.environ.get("R2R_DEBUG_HANG", "").lower() in {"1", "true", "yes", "on"}
+
+
+def _debug_hang(message: str) -> None:
+    if _debug_hang_enabled():
+        print(f"[R2R_DEBUG_HANG][llm] {message}", flush=True)
+
+
+def _rid_matches(req_rid, abort_rid: str) -> bool:
+    return bool(abort_rid) and str(req_rid).startswith(abort_rid)
+
+
+def _remove_issued_req_by_rid(scheduler: Scheduler, rid: str) -> bool:
+    issued_reqs = getattr(scheduler, "issued_reqs", None)
+    if issued_reqs is None:
+        return False
+    removed = False
+    for issued_req in list(issued_reqs):
+        if _rid_matches(getattr(issued_req, "rid", ""), rid):
+            try:
+                issued_reqs.remove(issued_req)
+                removed = True
+            except Exception:
+                pass
+    return removed
+
+
+def _abort_batch(scheduler: Scheduler, batch, abort_req: AbortReq) -> int:
+    if batch is None:
+        return 0
+    keep_indices = []
+    removed = 0
+    for i, req in enumerate(list(batch.reqs)):
+        if abort_req.abort_all or _rid_matches(getattr(req, "rid", ""), abort_req.rid):
+            try:
+                req.to_abort = True
+                req.to_abort_message = "Aborted by AbortReq."
+                req.check_finished()
+            except Exception:
+                pass
+            try:
+                scheduler.tree_cache.cache_finished_req(req)
+            except Exception:
+                pass
+            _remove_issued_req_by_rid(scheduler, getattr(req, "rid", ""))
+            removed += 1
+        else:
+            keep_indices.append(i)
+    if removed:
+        batch.filter_batch(keep_indices=keep_indices)
+        try:
+            batch.batch_is_full = False
+        except Exception:
+            pass
+    return removed
+
+
+def _abort_scheduler_request(scheduler: Scheduler, abort_req: AbortReq) -> dict:
+    removed = {
+        "waiting_queue": 0,
+        "running_batch": 0,
+        "last_batch": 0,
+        "batch_not_need": 0,
+        "cur_batch": 0,
+        "issued_reqs": 0,
+        "chunked_req": 0,
+    }
+
+    waiting_queue = getattr(scheduler, "waiting_queue", None)
+    if waiting_queue is not None:
+        kept = []
+        for req in list(waiting_queue):
+            if abort_req.abort_all or _rid_matches(getattr(req, "rid", ""), abort_req.rid):
+                removed["waiting_queue"] += 1
+                _remove_issued_req_by_rid(scheduler, getattr(req, "rid", ""))
+            else:
+                kept.append(req)
+        scheduler.waiting_queue = kept
+
+    seen_batches = set()
+    for attr in ("running_batch", "last_batch", "batch_not_need", "cur_batch"):
+        batch = getattr(scheduler, attr, None)
+        if batch is None or id(batch) in seen_batches:
+            continue
+        seen_batches.add(id(batch))
+        removed[attr] += _abort_batch(scheduler, batch, abort_req)
+
+    chunked_req = getattr(scheduler, "chunked_req", None)
+    if chunked_req is not None and (
+        abort_req.abort_all or _rid_matches(getattr(chunked_req, "rid", ""), abort_req.rid)
+    ):
+        try:
+            scheduler.tree_cache.cache_finished_req(chunked_req)
+        except Exception:
+            pass
+        _remove_issued_req_by_rid(scheduler, getattr(chunked_req, "rid", ""))
+        scheduler.chunked_req = None
+        removed["chunked_req"] = 1
+
+    if abort_req.abort_all:
+        issued_reqs = getattr(scheduler, "issued_reqs", None)
+        if issued_reqs is not None:
+            removed["issued_reqs"] += len(issued_reqs)
+            issued_reqs.clear()
+    elif _remove_issued_req_by_rid(scheduler, abort_req.rid):
+        removed["issued_reqs"] += 1
+
+    running_batch = getattr(scheduler, "running_batch", None)
+    if running_batch is not None:
+        try:
+            running_batch.batch_is_full = False
+        except Exception:
+            pass
+    return removed
+
+
+def _active_rids(scheduler: Scheduler) -> set:
+    active = getattr(scheduler, "r2r_active_rids", None)
+    if active is None:
+        active = set()
+        scheduler.r2r_active_rids = active
+    return active
+
+
+def _activate_rid(scheduler: Scheduler, rid: str) -> None:
+    active = _active_rids(scheduler)
+    if rid not in active:
+        active.add(rid)
+        scheduler.n_active_reqs += 1
+
+
+def _deactivate_rid(scheduler: Scheduler, rid: str) -> bool:
+    active = _active_rids(scheduler)
+    if rid not in active:
+        return False
+    active.remove(rid)
+    scheduler.n_active_reqs = max(0, scheduler.n_active_reqs - 1)
+    return True
+
+
 class LLMServer:
     """LLM Server launched by SGLang"""
     def __init__(
@@ -194,7 +336,20 @@ class LLMServer:
         signal.signal(signal.SIGTERM, _worker_sig_handler)
         # Use a dedicated tcp init_method to avoid port collision with quick model's default 29500 store
         init_method = f"tcp://127.0.0.1:{master_port}"
-        dist.init_process_group(backend='nccl', init_method=init_method, rank=rank, world_size=world_size)
+        try:
+            dist.init_process_group(
+                backend='nccl',
+                init_method=init_method,
+                rank=rank,
+                world_size=world_size,
+            )
+        except Exception as e:
+            if ready_queue is not None:
+                try:
+                    ready_queue.put(("ERROR", rank, repr(e)))
+                except Exception:
+                    pass
+            raise
         gpu_id = base_gpu_id + rank
         torch.cuda.set_device(gpu_id)
 
@@ -232,13 +387,31 @@ class LLMServer:
                     )
                     is_shutdown = [msg for msg in slm_reqs if getattr(msg, "status", "") == "SHUTDOWN"]
                     is_reset_cache = [msg for msg in slm_reqs if getattr(msg, "status", "") == "RESET_CACHE"]
-                    slm_reqs = [msg for msg in slm_reqs if getattr(msg, "status", "") not in ("SHUTDOWN", "RESET_CACHE")]
+                    is_abort = [msg for msg in slm_reqs if getattr(msg, "status", "") == "ABORT"]
+                    slm_reqs = [msg for msg in slm_reqs if getattr(msg, "status", "") not in ("SHUTDOWN", "RESET_CACHE", "ABORT")]
                     if is_shutdown:
                         print(f"[reference rank{rank}] SHUTDOWN received (queue), exiting...")
                         break
                     elif is_reset_cache:
                         ok = scheduler.flush_cache()
                         print(f"[reference rank{rank}] Cache reset (queue): {ok}")
+                    if is_abort:
+                        for msg in is_abort:
+                            abort_req = AbortReq(getattr(msg, "rid", ""))
+                            removed = _abort_scheduler_request(scheduler, abort_req)
+                            try:
+                                scheduler.abort_request(abort_req)
+                            except Exception:
+                                pass
+                            if abort_req.abort_all:
+                                _active_rids(scheduler).clear()
+                                scheduler.n_active_reqs = 0
+                            else:
+                                _deactivate_rid(scheduler, abort_req.rid)
+                            _debug_hang(
+                                f"rank={rank} abort rid={abort_req.rid} "
+                                f"removed={removed} active_after={getattr(scheduler, 'n_active_reqs', None)}"
+                            )
                     if slm_reqs:
                         LLMServer.process_result_from_slm(scheduler, slm_reqs)
 
@@ -297,19 +470,38 @@ class LLMServer:
         new_token_ids = {}
         returned_rid_list = []
         finished_rid_list = set()
+        n_active_before = getattr(scheduler, "n_active_reqs", None)
         if scheduler.batch_not_need is not None:
             req_already_prefilled = [req.rid for req in scheduler.batch_not_need.reqs]
         else:
             req_already_prefilled = []
+        if _debug_hang_enabled():
+            msg_summary = [
+                (
+                    getattr(waiting_req, "rid", None),
+                    getattr(waiting_req, "status", None),
+                    len(getattr(waiting_req, "new_token_ids", []) or []),
+                )
+                for waiting_req in commit_msgs
+            ]
+            _debug_hang(
+                f"recv_from_slm msgs={msg_summary} active_before={n_active_before} "
+                f"waiting_len={len(getattr(scheduler, 'waiting_queue', []))} "
+                f"batch_not_need_rids={req_already_prefilled}"
+            )
         for waiting_req in commit_msgs:
             new_token_ids[waiting_req.rid] = waiting_req.new_token_ids
             returned_rid_list.append(waiting_req.rid)
             if waiting_req.status == "finished":
                 finished_rid_list.add(waiting_req.rid)
-                scheduler.n_active_reqs -= 1
+                deactivated = _deactivate_rid(scheduler, waiting_req.rid)
+                _debug_hang(
+                    f"finish_notice rid={waiting_req.rid} deactivated={deactivated} "
+                    f"active_after={scheduler.n_active_reqs}"
+                )
                 continue
             if waiting_req.rid not in req_already_prefilled:
-                scheduler.n_active_reqs += 1
+                _activate_rid(scheduler, waiting_req.rid)
                 origin_input_ids = waiting_req.new_token_ids
                 origin_input_text = scheduler.tokenizer.decode(origin_input_ids)
                 new_req = Req(
@@ -326,6 +518,10 @@ class LLMServer:
                 if not hasattr(new_req, 'device'):
                     new_req.device = scheduler.batch_not_need.device
                 scheduler.waiting_queue.append(new_req)
+                _debug_hang(
+                    f"enqueue_new rid={new_req.rid} input_len={len(origin_input_ids)} "
+                    f"active_after={scheduler.n_active_reqs} waiting_len={len(scheduler.waiting_queue)}"
+                )
 
         if scheduler.batch_not_need is not None:
             not_keep_indices = []
@@ -349,6 +545,11 @@ class LLMServer:
                     if not hasattr(new_req, 'device'):
                         new_req.device = scheduler.batch_not_need.device
                     scheduler.waiting_queue.append(new_req)
+                    _debug_hang(
+                        f"enqueue_reuse rid={new_req.rid} append_len={len(new_token_ids[req.rid])} "
+                        f"input_len={len(origin_input_ids)} cached_len={len(req.last_cached_loc)} "
+                        f"waiting_len={len(scheduler.waiting_queue)}"
+                    )
                 else:
                     not_keep_indices.append(i)
             scheduler.batch_not_need.filter_batch(keep_indices=not_keep_indices)
@@ -555,6 +756,13 @@ class LLMServer:
             req.status = "notneed"
             waiting_req = WaitingReq(rid=req.rid,new_token_ids=[next_token_id],sampling_params=None)
             req_to_send.append(waiting_req)
+        _debug_hang(
+            f"rank={rank} send_to_slm rids={[req.rid for req in batch.reqs]} "
+            f"tokens={next_token_ids} batch_size={batch.batch_size()}"
+        )
+        if len(req_to_send) > 0:
+            # Make the rid reusable before SLM can send the next incremental token.
+            scheduler.check_batch_status(batch)
         if rank == 0:
             try:
                 outbound_queue.put_nowait(req_to_send)
