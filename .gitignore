@@ -24,7 +24,6 @@
 *.arrow-lock
 *.mdc
 *.whl
-*.sh
 !test/test_speed.sh
 *.svg
 *.code-workspace
@@ -39,3 +38,4 @@ evaluate/*
 R2R/eval_output
 model/
 .codex
+setup.sh
